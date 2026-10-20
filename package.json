@@ -1,0 +1,17 @@
+{
+  "name": "erra-auto-lead",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Erra Auto Lead: multi-session WhatsApp ingestion to Firestore using text rules",
+  "scripts": { "start": "node src/server.js", "dev": "node --watch src/server.js" },
+  "engines": { "node": ">=20.0.0" },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.18",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  }
+}
