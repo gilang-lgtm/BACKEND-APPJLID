@@ -10,7 +10,7 @@ if (!adminKey || adminKey.length < 24 || adminKey.startsWith('ganti_')) {
   );
 }
 
-const storageDir = process.env.STORAGE_DIR || '/data';
+const storageDir = process.env.STORAGE_DIR || '/app/sessions';
 
 export const config = {
   port: Number(process.env.PORT || 3000),
