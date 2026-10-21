@@ -135,7 +135,7 @@ async function handleIncoming(session, msg) {
 
   const text = getMessageText(msg).trim();
   if (!text) return; // Media tanpa caption tidak bisa diekstrak dengan aturan teks.
-  const extracted = extractLead({ text, pushName: msg.pushName || '', phone });
+  const extracted = await extractLead({ text, pushName: msg.pushName || '', phone });
   if (!extracted) return;
   const result = await upsertLead({ sales: session.sales, extracted });
   logger.info({ salesId: session.sales.salesId, phone, action: result.action, leadId: result.id, kebutuhan: extracted.kebutuhan, budget: extracted.budget }, 'Lead diproses');
