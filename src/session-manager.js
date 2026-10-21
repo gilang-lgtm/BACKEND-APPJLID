@@ -99,10 +99,22 @@ async function startSocket(session, folder) {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      logger.info(
+        { salesId: session.sales.salesId, type, count: messages.length },
+        '[MSG] upsert diterima'
+      );
+      if (type !== 'notify') {
+        logger.info({ salesId: session.sales.salesId, type }, '[MSG] dilewati: type bukan notify');
+        return;
+      }
       for (const msg of messages) {
         try { await handleIncoming(session, msg); }
-        catch (err) { logger.error({ err, salesId: session.sales.salesId }, 'Gagal memproses chat masuk'); }
+        catch (err) {
+          logger.error(
+            { err, salesId: session.sales.salesId, msgId: msg?.key?.id },
+            '[MSG] GAGAL memproses'
+          );
+        }
       }
     });
   } finally {
@@ -122,23 +134,67 @@ function getMessageText(msg) {
     || '';
 }
 
+function logSkip(session, reason, extra = {}) {
+  logger.info({ salesId: session.sales.salesId, reason, ...extra }, '[MSG] dilewati');
+}
+
 async function handleIncoming(session, msg) {
-  if (!msg?.key || msg.key.fromMe) return;
+  const salesId = session.sales.salesId;
+  if (!msg?.key) return logSkip(session, 'tidak ada key');
+
   const remoteJid = msg.key.remoteJid || '';
-  // Abaikan grup, broadcast, status, dan JID non-nomor.
-  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) return;
-  if (!remoteJid.endsWith('@s.whatsapp.net')) return;
-  const phone = remoteJid.split('@')[0].replace(/\D/g, '');
-  if (!phone || phone === session.phone) return;
-  const messageKey = msg.key.id;
-  if (messageKey && !(await recordMessageOnce(session.sales.salesId, messageKey))) return;
+  const altJid = msg.key.remoteJidAlt || msg.key.senderPn || '';
+  const msgId = msg.key.id;
+
+  logger.info(
+    { salesId, msgId, remoteJid, altJid, fromMe: !!msg.key.fromMe, pushName: msg.pushName || '' },
+    '[MSG] pesan masuk'
+  );
+
+  if (msg.key.fromMe) return logSkip(session, 'pesan dari sales sendiri', { msgId });
+
+  if (remoteJid.endsWith('@g.us')) return logSkip(session, 'grup', { msgId });
+  if (remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast') return logSkip(session, 'broadcast/status', { msgId });
+  if (remoteJid.endsWith('@newsletter')) return logSkip(session, 'newsletter', { msgId });
+
+  // Tangani format LID: pakai nomor asli jika tersedia
+  let jid = remoteJid;
+  if (remoteJid.endsWith('@lid')) {
+    if (altJid.endsWith('@s.whatsapp.net')) {
+      jid = altJid;
+      logger.info({ salesId, msgId, lid: remoteJid, resolved: altJid }, '[MSG] LID dipetakan ke nomor');
+    } else {
+      return logSkip(session, 'JID @lid tanpa nomor asli (remoteJidAlt/senderPn kosong)', { msgId, remoteJid });
+    }
+  }
+  if (!jid.endsWith('@s.whatsapp.net')) return logSkip(session, 'JID bukan nomor personal', { msgId, jid });
+
+  const phone = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (!phone) return logSkip(session, 'nomor kosong', { msgId });
+  if (phone === session.phone) return logSkip(session, 'nomor sama dengan akun sales', { msgId });
 
   const text = getMessageText(msg).trim();
-  if (!text) return; // Media tanpa caption tidak bisa diekstrak dengan aturan teks.
+  if (!text) {
+    return logSkip(session, 'tidak ada teks/caption', { msgId, phone, tipe: Object.keys(msg.message || {}).join(',') });
+  }
+  logger.info({ salesId, msgId, phone, preview: text.slice(0, 80) }, '[MSG] teks terbaca');
+
+  // Ekstraksi DULU, baru tandai sebagai sudah diproses
   const extracted = await extractLead({ text, pushName: msg.pushName || '', phone });
-  if (!extracted) return;
+  if (!extracted) {
+    return logSkip(session, 'bukan lead (tidak ada intent/kebutuhan/budget/referensi)', { msgId, phone });
+  }
+  logger.info(
+    { salesId, msgId, phone, nama: extracted.nama, kebutuhan: extracted.kebutuhan, budget: extracted.budget, referensi: extracted.referensiLaptop },
+    '[MSG] hasil ekstraksi'
+  );
+
+  if (msgId && !(await recordMessageOnce(salesId, msgId))) {
+    return logSkip(session, 'duplikat (sudah pernah diproses)', { msgId });
+  }
+
   const result = await upsertLead({ sales: session.sales, extracted });
-  logger.info({ salesId: session.sales.salesId, phone, action: result.action, leadId: result.id, kebutuhan: extracted.kebutuhan, budget: extracted.budget }, 'Lead diproses');
+  logger.info({ salesId, msgId, phone, action: result.action, leadId: result.id }, '[MSG] lead tersimpan');
 }
 
 export async function disconnectSales(salesId, logout = false) {
