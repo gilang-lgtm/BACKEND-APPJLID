@@ -8,7 +8,17 @@ import { extractLead } from './extractor.js';
 import { recordMessageOnce, upsertLead } from './firestore-leads.js';
 
 // Logger internal Baileys: hanya warn/error supaya log tidak penuh JSON noise.
-const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
+// Output dipadatkan jadi satu baris: [BAILEYS] ERROR pesan -> detail
+const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' }, {
+  write(line) {
+    try {
+      const o = JSON.parse(line);
+      const lvl = o.level >= 50 ? 'ERROR' : 'WARN';
+      const detail = o.err?.message || o.error || '';
+      console.log(`[BAILEYS] ${lvl} ${o.msg || ''}${detail ? ` -> ${detail}` : ''}`);
+    } catch { console.log(String(line).trim()); }
+  },
+});
 const sessions = new Map();
 const metadataPath = path.join(config.dataDir, 'sales-sessions.json');
 let restoring = false;
@@ -27,6 +37,11 @@ function log(tag, text) {
 function logErr(tag, text, err) {
   console.error(`[${tag}] ERROR ${text}${err ? ` -> ${err?.message || err}` : ''}`);
   if (err?.stack) console.error(err.stack);
+}
+function closeSocket(session) {
+  const old = session.socket;
+  session.socket = null;
+  try { old?.end(undefined); } catch { /* sudah tertutup */ }
 }
 const who = (session) => session.sales.salesName || session.sales.salesId;
 
@@ -78,6 +93,7 @@ async function startSocket(session, folder) {
   if (session.starting) return;
   session.starting = true;
   try {
+    closeSocket(session); // cegah socket ganda untuk sesi yang sama
     const { state, saveCreds } = await useMultiFileAuthState(folder);
     const sock = makeWASocket({
       auth: state,
@@ -92,6 +108,7 @@ async function startSocket(session, folder) {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+      if (session.socket !== sock) return; // abaikan event dari socket lama
       if (qr) {
         try {
           session.qr = await QRCode.toDataURL(qr);
@@ -101,6 +118,7 @@ async function startSocket(session, folder) {
       if (connection === 'open') {
         session.connected = true;
         session.qr = null;
+        session.retry = 0;
         session.phone = sock.user?.id?.split(':')[0]?.split('@')[0] || null;
         log('WA', `TERHUBUNG ${session.phone} | ${who(session)}`);
       }
@@ -109,13 +127,49 @@ async function startSocket(session, folder) {
         session.qr = null;
         const code = lastDisconnect?.error?.output?.statusCode;
         log('WA', `TERPUTUS kode=${code ?? '-'} | ${who(session)}`);
-        if (session.enabled && code !== DisconnectReason.loggedOut) {
-          setTimeout(() => startSocket(session, folder).catch(err => logErr('WA', `reconnect gagal | ${who(session)}`, err)), 3000);
+        if (!session.enabled) return;
+
+        // 401: WhatsApp melogout perangkat ini -> kredensial basi, hapus lalu minta scan QR ulang.
+        if (code === DisconnectReason.loggedOut) {
+          const now = Date.now();
+          session.logouts = (session.logouts || []).filter(t => now - t < 5 * 60 * 1000);
+          session.logouts.push(now);
+          closeSocket(session);
+          fs.rmSync(folder, { recursive: true, force: true });
+          if (session.logouts.length > 3) {
+            session.enabled = false;
+            saveMetadata();
+            log('WA', `BERHENTI: terlalu sering logout, tekan Hubungkan WhatsApp lagi | ${who(session)}`);
+            return;
+          }
+          log('WA', `LOGOUT 401: kredensial dihapus, menyiapkan QR baru | ${who(session)}`);
+          setTimeout(() => startSocket(session, folder).catch(err => logErr('WA', `restart gagal | ${who(session)}`, err)), 1500);
+          return;
         }
+
+        // 440: akun dipakai koneksi lain (mis. dua pod) -> jangan saling rebut.
+        if (code === DisconnectReason.connectionReplaced) {
+          closeSocket(session);
+          session.enabled = false;
+          saveMetadata();
+          log('WA', `BERHENTI: sesi dipakai koneksi lain (440). Pastikan hanya 1 instance berjalan | ${who(session)}`);
+          return;
+        }
+
+        // Lainnya: reconnect dengan jeda bertambah (maks 60 detik).
+        session.retry = (session.retry || 0) + 1;
+        const delay = Math.min(3000 * 2 ** (session.retry - 1), 60000);
+        log('WA', `reconnect ke-${session.retry} dalam ${Math.round(delay / 1000)} dtk | ${who(session)}`);
+        setTimeout(() => {
+          if (session.enabled && !session.connected) {
+            startSocket(session, folder).catch(err => logErr('WA', `reconnect gagal | ${who(session)}`, err));
+          }
+        }, delay);
       }
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (session.socket !== sock) return;
       log('MSG', `upsert type=${type} jumlah=${messages.length} | ${who(session)}`);
       if (type !== 'notify') {
         log('MSG', `SKIP type bukan notify (${type}) | ${who(session)}`);
