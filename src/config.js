@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import path from 'node:path';
 
@@ -17,6 +16,10 @@ export const config = {
   host: process.env.HOST || '0.0.0.0',
   adminKey,
   projectId: process.env.FIREBASE_PROJECT_ID || undefined,
+  // Isi service account key (JSON) dari Firebase Console -> Project Settings
+  // -> Service Accounts -> Generate new private key. Di-paste apa adanya
+  // sebagai environment variable FIREBASE_SERVICE_ACCOUNT_JSON.
+  serviceAccountJson: process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '',
   sessionsDir: path.join(storageDir, 'sessions'),
   dataDir: path.join(storageDir, 'data'),
 };
