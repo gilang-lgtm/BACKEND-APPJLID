@@ -226,20 +226,29 @@ async function handleIncoming(session, msg) {
   const text = getMessageText(msg).trim();
   if (!text) return; // Media tanpa caption tidak bisa diekstrak dengan aturan teks.
 
-  const preview = text.length > 80 ? text.slice(0, 80) + '...' : text;
-  log('CHAT', `masuk dari ${phone}`, `${session.sales.branch} | "${preview}"`);
+  // Teks pesan ditampilkan PENUH (tidak dipotong) supaya kelihatan jelas
+  // apa isi chat yang baru masuk.
+  log('CHAT', `masuk dari ${phone}`, `${session.sales.branch} | "${text}"`);
 
-  const extracted = await extractLead({ text, pushName: msg.pushName || '', phone });
+  const { lead: extracted, method, fallbackReason } = await extractLead({ text, pushName: msg.pushName || '', phone });
+
+  const methodLabel = method === 'gemini' ? 'AI Gemini' : 'aturan kata kunci (fallback)';
+  if (fallbackReason) {
+    // Gemini gagal dipanggil -- alasannya ditulis langsung di log utama
+    // (bukan cuma di error log) supaya gampang ketahuan kalau Gemini
+    // sering gagal dan keseringan jatuh ke fallback yang lebih kaku.
+    log('CHAT', `Gemini gagal, pakai fallback (${fallbackReason})`, `${phone} | ${session.sales.branch}`);
+  }
+
   if (!extracted) {
-    log('CHAT', 'diabaikan (tidak dikenali sebagai lead)', `${phone} | ${session.sales.branch}`);
+    log('CHAT', `diabaikan, tidak dikenali sebagai lead (via ${methodLabel})`, `${phone} | ${session.sales.branch}`);
     return;
   }
 
-  const method = extracted.extractionMethod === 'gemini' ? 'AI Gemini' : 'aturan kata kunci (fallback)';
   const result = await upsertLead({ sales: session.sales, extracted });
   log(
     'LEAD',
-    `${result.action} id=${result.id} via ${method}`,
+    `${result.action} id=${result.id} via ${methodLabel}`,
     `${phone} | ${session.sales.branch} | nama=${extracted.nama || '-'} kebutuhan=${extracted.kebutuhan || '-'} budget=${extracted.budget || '-'} referensi=${extracted.referensiLaptop || '-'}`
   );
 }
@@ -273,6 +282,11 @@ export async function restoreSessions() {
       const s = {
         sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch },
         connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
+        // JANGAN di-hardcode true di sini -- startSocket() di bawah akan
+        // menentukan nilai sebenarnya dari creds.registered begitu folder
+        // sesinya dibaca. Sesi yang BELUM pernah discan (creds.registered
+        // masih false) harus tetap tunduk ke jam idle, bukan dianggap
+        // "sudah terhubung" cuma karena pernah tersimpan di metadata.
         hasEverConnected: false,
         lastRequestedAt: Date.now(),
       };
