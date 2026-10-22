@@ -9,7 +9,6 @@ import {
     getSession,
     listSessions,
     restoreSessions,
-    touchSession,
   } from './session-manager.js';
 
 const app = express();
@@ -106,7 +105,6 @@ app.post('/api/sessions', requireFirebaseUser, async (req, res) => {
 });
 
 app.get('/api/sessions/:salesId', requireFirebaseUser, ensureOwnUid, async (req, res) => {
-  touchSession(req.params.salesId);
   const session = getSession(req.params.salesId);
   if (!session) {
     const sales = await getSalesProfile(req.authUser.uid).catch(() => null);
