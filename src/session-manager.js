@@ -109,6 +109,18 @@ async function startSocket(session, folder) {
   session.starting = true;
   try {
     const { state, saveCreds } = await useMultiFileAuthState(folder);
+
+    // `creds.registered` adalah penanda resmi dari Baileys: true hanya
+    // kalau proses pairing WA ini PERNAH berhasil sebelumnya (file
+    // kredensial valid tersimpan di folder sesi). Dipakai untuk membedakan
+    // sesi yang "sudah pernah discan sales" (boleh auto-reconnect terus
+    // walau idle, wajar dipulihkan kalau cuma putus jaringan) dari sesi
+    // yang "belum pernah discan sama sekali" (harus tunduk ke jam idle,
+    // supaya tidak auto-generate QR selamanya tanpa ada yang minta).
+    if (state.creds?.registered) {
+      session.hasEverConnected = true;
+    }
+
     const sock = makeWASocket({
       auth: state,
       logger: baileysLogger, // logger silent khusus baileys, bukan logger aplikasi
@@ -261,7 +273,7 @@ export async function restoreSessions() {
       const s = {
         sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch },
         connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
-        hasEverConnected: true,
+        hasEverConnected: false,
         lastRequestedAt: Date.now(),
       };
       sessions.set(item.salesId, s);
