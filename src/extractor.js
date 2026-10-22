@@ -5,7 +5,15 @@
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 8000);
+// Dinaikkan dari 8 detik -> 15 detik: 8 detik kadang kurang untuk koneksi
+// dari host hosting ke API Google, bikin keseringan abort padahal
+// sebenarnya cuma lambat, bukan benar-benar gagal.
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 15000);
+
+// ====================================================================
+// METODE LAMA: aturan kata kunci (FALLBACK saja -- dipakai kalau
+// Gemini gagal, timeout, atau GEMINI_API_KEY belum di-set)
+// ====================================================================
 
 const NEEDS = [
   { value: 'Gaming', words: ['gaming', 'main game', 'game', 'valorant', 'dota', 'pubg', 'genshin', 'rtx', 'gtx'] },
@@ -85,6 +93,10 @@ function extractLeadRuleBased({ text = '', pushName = '', phone = '' }) {
   };
 }
 
+// ====================================================================
+// METODE UTAMA: ekstraksi pakai Gemini -- jauh lebih toleran terhadap
+// typo, singkatan, dan format bahasa sehari-hari dibanding regex kaku.
+// ====================================================================
 
 const SYSTEM_PROMPT = `Kamu membantu toko laptop membaca pesan WhatsApp dari calon pembeli (leads).
 Tugasmu: baca SATU pesan WhatsApp -- yang bisa jadi memakai bahasa santai, typo, atau singkatan -- lalu keluarkan JSON terstruktur.
@@ -101,14 +113,9 @@ Pesan customer sering mengandung typo atau disingkat -- jangan terlalu kaku, pah
 Balas HANYA dengan JSON valid, tanpa markdown code fence, tanpa penjelasan tambahan. Contoh:
 {"nama":null,"kebutuhan":"Kuliah","budget":"3 Jutaan","referensiLaptop":null,"isLead":true}`;
 
-async function extractLeadWithGemini({ text, pushName, phone }) {
-  if (!GEMINI_API_KEY) {
-    console.warn('GEMINI_API_KEY belum di-set, pakai fallback aturan kata kunci');
-    return null;
-  }
-
+async function callGeminiOnce({ text, pushName, phone, timeoutMs }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -120,10 +127,7 @@ async function extractLeadWithGemini({ text, pushName, phone }) {
           parts: [{ text: `Nama kontak WhatsApp (bisa jadi bukan nama asli): "${pushName || '(tidak ada)'}"\nPesan: "${text}"` }],
         },
       ],
-      generationConfig: {
-        temperature: 0,
-        responseMimeType: 'application/json',
-      },
+      generationConfig: { temperature: 0, responseMimeType: 'application/json' },
     };
 
     const res = await fetch(url, {
@@ -135,59 +139,71 @@ async function extractLeadWithGemini({ text, pushName, phone }) {
 
     if (!res.ok) {
       const errText = await res.text().catch(() => '');
-      console.error(`Gemini API error ${res.status}: ${errText.slice(0, 300)}`);
-      return null; // fallback
+      return { ok: false, reason: `HTTP ${res.status}: ${errText.slice(0, 200)}` };
     }
 
     const data = await res.json();
     const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!raw) {
-      console.error('Gemini tidak mengembalikan teks JSON, response:', JSON.stringify(data).slice(0, 300));
-      return null;
-    }
+    if (!raw) return { ok: false, reason: 'respons Gemini kosong/tidak ada teks' };
 
     const parsed = JSON.parse(raw);
-    if (!parsed.isLead) return null;
+    if (!parsed.isLead) return { ok: true, lead: null }; // berhasil diproses, tapi memang bukan lead
 
     return {
-      nama: (parsed.nama && String(parsed.nama).trim()) || pushName?.trim() || 'Pelanggan WhatsApp',
-      nomorWa: phone,
-      kebutuhan: parsed.kebutuhan || null,
-      budget: parsed.budget || null,
-      referensiLaptop: parsed.referensiLaptop || null,
-      rawMessage: String(text).slice(0, 1500),
-      extractionMethod: 'gemini',
+      ok: true,
+      lead: {
+        nama: (parsed.nama && String(parsed.nama).trim()) || pushName?.trim() || 'Pelanggan WhatsApp',
+        nomorWa: phone,
+        kebutuhan: parsed.kebutuhan || null,
+        budget: parsed.budget || null,
+        referensiLaptop: parsed.referensiLaptop || null,
+        rawMessage: String(text).slice(0, 1500),
+        extractionMethod: 'gemini',
+      },
     };
   } catch (err) {
-    console.error('Gemini extraction gagal, fallback ke aturan kata kunci:', err?.message || err);
-    return null; // fallback
+    const reason = err?.name === 'AbortError' ? `timeout setelah ${timeoutMs}ms` : (err?.message || String(err));
+    return { ok: false, reason };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-// ====================================================================
-// FUNGSI UTAMA yang dipanggil dari session-manager.js
-// PENTING: fungsi ini ASYNC -- pemanggilnya WAJIB pakai `await`:
-//   const extracted = await extractLead({ text, pushName, phone });
-// ====================================================================
+async function extractLeadWithGemini({ text, pushName, phone }) {
+  if (!GEMINI_API_KEY) {
+    return { ok: false, reason: 'GEMINI_API_KEY belum di-set' };
+  }
+
+  // Coba 2x: percobaan pertama bisa gagal karena koneksi lambat/sesaat,
+  // jadi jangan langsung nyerah ke fallback kata kunci yang lebih kaku.
+  let last = await callGeminiOnce({ text, pushName, phone, timeoutMs: GEMINI_TIMEOUT_MS });
+  if (!last.ok) {
+    last = await callGeminiOnce({ text, pushName, phone, timeoutMs: GEMINI_TIMEOUT_MS });
+  }
+  return last;
+}
+
 
 export async function extractLead({ text = '', pushName = '', phone = '' }) {
   const normalized = String(text).replace(/‎|‏/g, ' ').trim();
-  if (!normalized) return null;
+  if (!normalized) return { lead: null, method: null, fallbackReason: null };
 
-  const aiResult = await extractLeadWithGemini({ text: normalized, pushName, phone });
-  if (aiResult) return aiResult;
+  const geminiResult = await extractLeadWithGemini({ text: normalized, pushName, phone });
 
-  return extractLeadRuleBased({ text: normalized, pushName, phone });
+  if (geminiResult.ok) {
+    // Gemini berhasil dipanggil (entah hasilnya lead atau memang bukan lead)
+    return { lead: geminiResult.lead, method: 'gemini', fallbackReason: null };
+  }
+
+  // Gemini gagal/timeout -> fallback ke aturan kata kunci, DAN catat alasannya
+  const ruleLead = extractLeadRuleBased({ text: normalized, pushName, phone });
+  return { lead: ruleLead, method: 'rule-based', fallbackReason: geminiResult.reason };
 }
 
 // Helper untuk tes manual dari terminal: node extractor.js
 if (process.argv[1]?.endsWith('extractor.js')) {
   const samples = [
     { text: 'Halo kak, saya Budi. Cari laptop buat kuliah budget 3 jutaan', pushName: 'Budi', phone: '628123456789' },
-    { text: 'Ada laptop buat gaming budget 2,5jt?', pushName: 'Andi', phone: '628111111111' },
-    { text: 'Halo kak', pushName: 'Test', phone: '628222222222' },
     { text: 'kak budget nya 2-3jtan ada ga buat kerjaan kantoran', pushName: 'Rina', phone: '628333333333' },
     { text: 'bdget 2jt an min ada yg bgus ga buat ngoding', pushName: 'Dedi', phone: '628444444444' },
   ];
