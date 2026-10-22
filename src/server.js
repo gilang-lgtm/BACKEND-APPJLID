@@ -3,13 +3,14 @@ import crypto from 'node:crypto';
 import { config } from './config.js';
 import { admin, db } from './firebase.js';
 import {
-  connectSales,
-  disconnectSales,
-  getQr,
-  getSession,
-  listSessions,
-  restoreSessions,
-} from './session-manager.js';
+    connectSales,
+    disconnectSales,
+    getQr,
+    getSession,
+    listSessions,
+    restoreSessions,
+    touchSession,
+  } from './session-manager.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -105,6 +106,7 @@ app.post('/api/sessions', requireFirebaseUser, async (req, res) => {
 });
 
 app.get('/api/sessions/:salesId', requireFirebaseUser, ensureOwnUid, async (req, res) => {
+  touchSession(req.params.salesId);
   const session = getSession(req.params.salesId);
   if (!session) {
     const sales = await getSalesProfile(req.authUser.uid).catch(() => null);
