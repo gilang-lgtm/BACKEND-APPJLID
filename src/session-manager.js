@@ -211,20 +211,49 @@ function getMessageText(msg) {
 }
 
 async function handleIncoming(session, msg) {
-  if (!msg?.key || msg.key.fromMe) return;
-  const remoteJid = msg.key.remoteJid || '';
-  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
-    log('MSG', 'SKIP grup', label(session));
+  if (!msg?.key) {
+    log('MSG', 'SKIP pesan tanpa key', label(session));
     return;
   }
-  if (!remoteJid.endsWith('@s.whatsapp.net')) return;
+  if (msg.key.fromMe) {
+    log('MSG', 'SKIP pesan dari diri sendiri (fromMe)', label(session));
+    return;
+  }
+  const remoteJid = msg.key.remoteJid || '';
+  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
+    log('MSG', 'SKIP grup/broadcast/status', `${label(session)} | jid=${remoteJid}`);
+    return;
+  }
+  if (!remoteJid.endsWith('@s.whatsapp.net')) {
+    // Ini titik penting untuk diagnosis: WhatsApp kadang mengirim JID
+    // dengan format lain (mis. "@lid" untuk kontak yang belum tersimpan
+    // di address book di WA versi baru), yang tidak match pola
+    // "@s.whatsapp.net" -- kalau log ini sering muncul, berarti chat
+    // masuk tapi diabaikan gara-gara format JID-nya, bukan karena
+    // ekstraksinya gagal.
+    log('MSG', 'SKIP format JID tidak dikenali', `${label(session)} | jid=${remoteJid}`);
+    return;
+  }
   const phone = remoteJid.split('@')[0].replace(/\D/g, '');
-  if (!phone || phone === session.phone) return;
+  if (!phone) {
+    log('MSG', 'SKIP nomor kosong setelah parsing JID', `${label(session)} | jid=${remoteJid}`);
+    return;
+  }
+  if (phone === session.phone) {
+    log('MSG', 'SKIP nomor sama dengan nomor toko sendiri', `${label(session)} | ${phone}`);
+    return;
+  }
   const messageKey = msg.key.id;
-  if (messageKey && !(await recordMessageOnce(session.sales.salesId, messageKey))) return;
+  if (messageKey && !(await recordMessageOnce(session.sales.salesId, messageKey))) {
+    log('MSG', 'SKIP sudah pernah diproses sebelumnya (duplikat)', `${label(session)} | ${phone} | id=${messageKey}`);
+    return;
+  }
 
   const text = getMessageText(msg).trim();
-  if (!text) return; // Media tanpa caption tidak bisa diekstrak dengan aturan teks.
+  if (!text) {
+    log('MSG', 'SKIP media tanpa teks/caption (gambar, voice note, stiker, dll)', `${label(session)} | ${phone}`);
+    return;
+  }
 
   // Teks pesan ditampilkan PENUH (tidak dipotong) supaya kelihatan jelas
   // apa isi chat yang baru masuk.
