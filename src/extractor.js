@@ -1,3 +1,12 @@
+// ============================================================
+// Ekstraksi lead dari chat WhatsApp -- AI (Gemini) sebagai metode
+// utama, dengan fallback ke aturan kata kunci kalau API gagal/timeout.
+// ============================================================
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 8000);
+
 const NEEDS = [
   { value: 'Gaming', words: ['gaming', 'main game', 'game', 'valorant', 'dota', 'pubg', 'genshin', 'rtx', 'gtx'] },
   { value: 'coding', words: ['coding', 'ngoding', 'programmer', 'programming', 'developer', 'software', 'program'] },
@@ -14,7 +23,6 @@ function hasWord(text, word) {
 
 function parseBudget(text) {
   const s = text.toLowerCase().replace(/,/g, '.');
-  // Contoh: budget 2 juta, 2jt, 2.5 jutaan, 1500000, 1.500.000
   const million = s.match(/(?:budget|modal|dana|harga|di kisaran|kisaran|sekitar|maksimal|max|kurang lebih|rp\s*)?\s*(\d+(?:\.\d+)?)\s*(juta|jutaan|jt|jtaan)\b/i);
   if (million) {
     const n = Number(million[1]);
@@ -28,7 +36,6 @@ function parseBudget(text) {
       return `${Number.isInteger(j) ? j : Number(j.toFixed(1)).toString().replace('.', ',')} Jutaan`;
     }
   }
-  // Pola bahasa sehari-hari: 2,5jt
   const compact = s.match(/\b(\d+(?:\.\d+)?)\s*jt\b/i);
   if (compact) return `${compact[1].replace('.', ',')} Jutaan`;
   return null;
@@ -55,8 +62,8 @@ function parseReference(text) {
   return v.length >= 2 ? v : null;
 }
 
-export function extractLead({ text = '', pushName = '', phone = '' }) {
-  const normalized = String(text).replace(/\u200e|\u200f/g, ' ').trim();
+function extractLeadRuleBased({ text = '', pushName = '', phone = '' }) {
+  const normalized = String(text).replace(/‎|‏/g, ' ').trim();
   if (!normalized) return null;
   const lower = normalized.toLowerCase();
   const kebutuhan = NEEDS.find(group => group.words.some(w => hasWord(lower, w)))?.value || null;
@@ -65,7 +72,6 @@ export function extractLead({ text = '', pushName = '', phone = '' }) {
   const referensiLaptop = parseReference(normalized);
 
   const leadIntent = /\b(laptop|notebook|komputer|pc|harga|budget|butuh|cari|mau beli|minat|rekomendasi|untuk kuliah|untuk kerja|buat gaming|spek|spesifikasi)\b/i.test(normalized);
-  // Jangan membuat lead hanya karena pelanggan mengirim "halo".
   if (!leadIntent && !kebutuhan && !budget && !referensiLaptop) return null;
 
   return {
@@ -75,15 +81,120 @@ export function extractLead({ text = '', pushName = '', phone = '' }) {
     budget: budget || null,
     referensiLaptop: referensiLaptop || null,
     rawMessage: normalized.slice(0, 1500),
+    extractionMethod: 'rule-based',
   };
 }
 
-// Helper dapat dijalankan tanpa WhatsApp untuk mengecek aturan.
+
+const SYSTEM_PROMPT = `Kamu membantu toko laptop membaca pesan WhatsApp dari calon pembeli (leads).
+Tugasmu: baca SATU pesan WhatsApp -- yang bisa jadi memakai bahasa santai, typo, atau singkatan -- lalu keluarkan JSON terstruktur.
+
+Field yang harus diisi (isi null kalau tidak disebutkan di pesan):
+- "nama": nama orangnya, HANYA kalau disebutkan eksplisit di pesan (mis. "nama saya Budi"). Jangan mengarang nama.
+- "kebutuhan": salah satu dari ["Gaming", "coding", "Kuliah", "Sekolah", "Kerja", "Personal"], atau null kalau tidak jelas.
+- "budget": perkiraan budget customer, dirapikan ke format singkat seperti "3 Jutaan" atau "2-3 Jutaan" kalau disebutkan rentang. Pahami semua variasi penulisan: "2jt", "2 jt", "2juta", "2-3jtan", "dua jutaan", "2.5jt", "2,5 juta", dsb -- semua itu tetap budget yang valid meski ada typo atau format tidak baku. Null kalau benar-benar tidak disebutkan.
+- "referensiLaptop": merk/tipe/spesifikasi laptop yang disebutkan customer, atau null kalau tidak ada.
+- "isLead": true kalau pesan ini menunjukkan minat membeli/bertanya soal laptop (apapun bahasanya, termasuk bahasa santai/typo/singkatan), false kalau pesan basa-basi yang sama sekali tidak relevan (mis. cuma "halo", "test", emoji saja, dll).
+
+Pesan customer sering mengandung typo atau disingkat -- jangan terlalu kaku, pahami maksudnya secara natural seperti manusia membaca chat, bukan mencocokkan pola persis.
+
+Balas HANYA dengan JSON valid, tanpa markdown code fence, tanpa penjelasan tambahan. Contoh:
+{"nama":null,"kebutuhan":"Kuliah","budget":"3 Jutaan","referensiLaptop":null,"isLead":true}`;
+
+async function extractLeadWithGemini({ text, pushName, phone }) {
+  if (!GEMINI_API_KEY) {
+    console.warn('GEMINI_API_KEY belum di-set, pakai fallback aturan kata kunci');
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const body = {
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: `Nama kontak WhatsApp (bisa jadi bukan nama asli): "${pushName || '(tidak ada)'}"\nPesan: "${text}"` }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: 'application/json',
+      },
+    };
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.error(`Gemini API error ${res.status}: ${errText.slice(0, 300)}`);
+      return null; // fallback
+    }
+
+    const data = await res.json();
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!raw) {
+      console.error('Gemini tidak mengembalikan teks JSON, response:', JSON.stringify(data).slice(0, 300));
+      return null;
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!parsed.isLead) return null;
+
+    return {
+      nama: (parsed.nama && String(parsed.nama).trim()) || pushName?.trim() || 'Pelanggan WhatsApp',
+      nomorWa: phone,
+      kebutuhan: parsed.kebutuhan || null,
+      budget: parsed.budget || null,
+      referensiLaptop: parsed.referensiLaptop || null,
+      rawMessage: String(text).slice(0, 1500),
+      extractionMethod: 'gemini',
+    };
+  } catch (err) {
+    console.error('Gemini extraction gagal, fallback ke aturan kata kunci:', err?.message || err);
+    return null; // fallback
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ====================================================================
+// FUNGSI UTAMA yang dipanggil dari session-manager.js
+// PENTING: fungsi ini ASYNC -- pemanggilnya WAJIB pakai `await`:
+//   const extracted = await extractLead({ text, pushName, phone });
+// ====================================================================
+
+export async function extractLead({ text = '', pushName = '', phone = '' }) {
+  const normalized = String(text).replace(/‎|‏/g, ' ').trim();
+  if (!normalized) return null;
+
+  const aiResult = await extractLeadWithGemini({ text: normalized, pushName, phone });
+  if (aiResult) return aiResult;
+
+  return extractLeadRuleBased({ text: normalized, pushName, phone });
+}
+
+// Helper untuk tes manual dari terminal: node extractor.js
 if (process.argv[1]?.endsWith('extractor.js')) {
   const samples = [
     { text: 'Halo kak, saya Budi. Cari laptop buat kuliah budget 3 jutaan', pushName: 'Budi', phone: '628123456789' },
     { text: 'Ada laptop buat gaming budget 2,5jt?', pushName: 'Andi', phone: '628111111111' },
     { text: 'Halo kak', pushName: 'Test', phone: '628222222222' },
+    { text: 'kak budget nya 2-3jtan ada ga buat kerjaan kantoran', pushName: 'Rina', phone: '628333333333' },
+    { text: 'bdget 2jt an min ada yg bgus ga buat ngoding', pushName: 'Dedi', phone: '628444444444' },
   ];
-  for (const sample of samples) console.log(JSON.stringify(extractLead(sample), null, 2));
+  (async () => {
+    for (const sample of samples) {
+      const result = await extractLead(sample);
+      console.log(JSON.stringify({ input: sample.text, result }, null, 2));
+    }
+  })();
 }
