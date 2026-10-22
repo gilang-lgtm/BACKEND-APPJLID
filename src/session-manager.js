@@ -7,43 +7,18 @@ import { config } from './config.js';
 import { extractLead } from './extractor.js';
 import { recordMessageOnce, upsertLead } from './firestore-leads.js';
 
-// Logger internal Baileys: hanya warn/error supaya log tidak penuh JSON noise.
-// Output dipadatkan jadi satu baris: [BAILEYS] ERROR pesan -> detail
-const baileysLogger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' }, {
-  write(line) {
-    try {
-      const o = JSON.parse(line);
-      const lvl = o.level >= 50 ? 'ERROR' : 'WARN';
-      const detail = o.err?.message || o.error || '';
-      console.log(`[BAILEYS] ${lvl} ${o.msg || ''}${detail ? ` -> ${detail}` : ''}`);
-    } catch { console.log(String(line).trim()); }
-  },
-});
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const sessions = new Map();
 const metadataPath = path.join(config.dataDir, 'sales-sessions.json');
 let restoring = false;
 
+// Kalau tidak ada yang minta/cek QR selama ini (sales menutup halaman
+// "Tautkan WhatsApp"), hentikan loop reconnect-buat-QR otomatis supaya
+// tidak jalan terus-menerus di background tanpa guna.
+const QR_IDLE_TIMEOUT_MS = Number(process.env.QR_IDLE_TIMEOUT_MS || 90000);
+
 fs.mkdirSync(config.sessionsDir, { recursive: true });
 fs.mkdirSync(config.dataDir, { recursive: true });
-
-// ---------- Log satu baris, info penting di depan ----------
-const cut = (v, n = 60) => {
-  const s = String(v ?? '').replace(/\s+/g, ' ').trim();
-  return s.length > n ? `${s.slice(0, n)}…` : s;
-};
-function log(tag, text) {
-  console.log(`[${tag}] ${text}`);
-}
-function logErr(tag, text, err) {
-  console.error(`[${tag}] ERROR ${text}${err ? ` -> ${err?.message || err}` : ''}`);
-  if (err?.stack) console.error(err.stack);
-}
-function closeSocket(session) {
-  const old = session.socket;
-  session.socket = null;
-  try { old?.end(undefined); } catch { /* sudah tertutup */ }
-}
-const who = (session) => session.sales.salesName || session.sales.salesId;
 
 function safeFolder(salesId) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(salesId)) throw new Error('salesId hanya boleh huruf, angka, _ atau -');
@@ -64,7 +39,20 @@ function statusOf(s) {
 
 export function listSessions() { return [...sessions.values()].map(statusOf); }
 export function getSession(salesId) { const s = sessions.get(salesId); return s ? statusOf(s) : null; }
-export function getQr(salesId) { const s = sessions.get(salesId); return s?.qr || null; }
+export function getQr(salesId) {
+  const s = sessions.get(salesId);
+  if (!s) return null;
+  touchSession(salesId); // sales lagi lihat/minta QR -> perpanjang jam idle
+  return s.qr || null;
+}
+
+// Dipanggil setiap kali ada aktivitas sales yang menandakan dia masih
+// menunggu untuk scan QR (buka halaman, polling status, polling QR).
+// Dipakai untuk menentukan kapan proses reconnect-buat-QR boleh berhenti.
+export function touchSession(salesId) {
+  const s = sessions.get(salesId);
+  if (s) s.lastRequestedAt = Date.now();
+}
 
 export async function connectSales({ salesId, salesName, branch }) {
   const folder = safeFolder(String(salesId || ''));
@@ -74,15 +62,20 @@ export async function connectSales({ salesId, salesName, branch }) {
   if (current?.starting || current?.connected) {
     current.sales = sales;
     current.enabled = true;
+    current.lastRequestedAt = Date.now();
     saveMetadata();
     return statusOf(current);
   }
   if (!current) {
-    current = { sales, connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null };
+    current = {
+      sales, connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
+      hasEverConnected: false, lastRequestedAt: Date.now(),
+    };
     sessions.set(sales.salesId, current);
   } else {
     current.sales = sales;
     current.enabled = true;
+    current.lastRequestedAt = Date.now();
   }
   saveMetadata();
   await startSocket(current, folder);
@@ -93,11 +86,10 @@ async function startSocket(session, folder) {
   if (session.starting) return;
   session.starting = true;
   try {
-    closeSocket(session); // cegah socket ganda untuk sesi yang sama
     const { state, saveCreds } = await useMultiFileAuthState(folder);
     const sock = makeWASocket({
       auth: state,
-      logger: baileysLogger.child({ salesId: session.sales.salesId }),
+      logger: logger.child({ salesId: session.sales.salesId }),
       printQRInTerminal: false,
       browser: ['Erra Auto Lead', 'Chrome', '1.0.0'],
       markOnlineOnConnect: false,
@@ -108,76 +100,63 @@ async function startSocket(session, folder) {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-      if (session.socket !== sock) return; // abaikan event dari socket lama
       if (qr) {
-        try {
-          session.qr = await QRCode.toDataURL(qr);
-          log('WA', `QR baru dibuat | ${who(session)}`);
-        } catch (e) { logErr('WA', `gagal membuat QR | ${who(session)}`, e); }
+        try { session.qr = await QRCode.toDataURL(qr); }
+        catch (e) { logger.error({ err: e }, 'Gagal membuat QR'); }
       }
       if (connection === 'open') {
         session.connected = true;
         session.qr = null;
-        session.retry = 0;
+        session.hasEverConnected = true;
         session.phone = sock.user?.id?.split(':')[0]?.split('@')[0] || null;
-        log('WA', `TERHUBUNG ${session.phone} | ${who(session)}`);
+        logger.info({ salesId: session.sales.salesId, phone: session.phone }, 'WhatsApp sales terhubung');
       }
       if (connection === 'close') {
         session.connected = false;
         session.qr = null;
         const code = lastDisconnect?.error?.output?.statusCode;
-        log('WA', `TERPUTUS kode=${code ?? '-'} | ${who(session)}`);
-        if (!session.enabled) return;
+        logger.warn({ salesId: session.sales.salesId, code }, 'Koneksi WhatsApp terputus');
 
-        // 401: WhatsApp melogout perangkat ini -> kredensial basi, hapus lalu minta scan QR ulang.
-        if (code === DisconnectReason.loggedOut) {
-          const now = Date.now();
-          session.logouts = (session.logouts || []).filter(t => now - t < 5 * 60 * 1000);
-          session.logouts.push(now);
-          closeSocket(session);
-          fs.rmSync(folder, { recursive: true, force: true });
-          if (session.logouts.length > 3) {
-            session.enabled = false;
-            saveMetadata();
-            log('WA', `BERHENTI: terlalu sering logout, tekan Hubungkan WhatsApp lagi | ${who(session)}`);
-            return;
-          }
-          log('WA', `LOGOUT 401: kredensial dihapus, menyiapkan QR baru | ${who(session)}`);
-          setTimeout(() => startSocket(session, folder).catch(err => logErr('WA', `restart gagal | ${who(session)}`, err)), 1500);
+        if (!session.enabled || code === DisconnectReason.loggedOut) {
+          return; // sesi memang dimatikan / logout -- jangan reconnect
+        }
+
+        // Sesi yang SUDAH PERNAH terhubung (sales sudah pernah scan QR
+        // sebelumnya, tapi koneksi putus karena jaringan dll) tetap
+        // direconnect otomatis seperti biasa -- ini WhatsApp yang sudah
+        // "dipakai", wajar dipulihkan otomatis.
+        if (session.hasEverConnected) {
+          setTimeout(() => startSocket(session, folder).catch(err => logger.error({ err }, 'Reconnect gagal')), 3000);
           return;
         }
 
-        // 440: akun dipakai koneksi lain (mis. dua pod) -> jangan saling rebut.
-        if (code === DisconnectReason.connectionReplaced) {
-          closeSocket(session);
-          session.enabled = false;
-          saveMetadata();
-          log('WA', `BERHENTI: sesi dipakai koneksi lain (440). Pastikan hanya 1 instance berjalan | ${who(session)}`);
-          return;
+        // Sesi BELUM PERNAH terhubung -- ini fase menunggu scan QR.
+        // Hanya lanjut buat QR baru & reconnect kalau masih ada yang
+        // aktif minta/lihat QR dalam QR_IDLE_TIMEOUT_MS terakhir
+        // (artinya sales masih membuka halaman "Tautkan WhatsApp").
+        // Kalau tidak, hentikan di sini -- tidak auto-generate QR lagi
+        // sampai sales menekan tombol "Tampilkan QR" / buka halaman lagi.
+        const idleFor = Date.now() - (session.lastRequestedAt || 0);
+        if (idleFor < QR_IDLE_TIMEOUT_MS) {
+          setTimeout(() => startSocket(session, folder).catch(err => logger.error({ err }, 'Reconnect gagal')), 3000);
+        } else {
+          logger.info(
+            { salesId: session.sales.salesId, idleForMs: idleFor },
+            'Tidak ada aktivitas sales, hentikan auto-generate QR. Tekan tombol untuk mencoba lagi.'
+          );
+          session.socket = null;
+          // Sesi dibiarkan "enabled" supaya tetap muncul di daftar, tapi
+          // tidak ada socket aktif -- connectSales() berikutnya akan
+          // memulai startSocket dari nol lagi.
         }
-
-        // Lainnya: reconnect dengan jeda bertambah (maks 60 detik).
-        session.retry = (session.retry || 0) + 1;
-        const delay = Math.min(3000 * 2 ** (session.retry - 1), 60000);
-        log('WA', `reconnect ke-${session.retry} dalam ${Math.round(delay / 1000)} dtk | ${who(session)}`);
-        setTimeout(() => {
-          if (session.enabled && !session.connected) {
-            startSocket(session, folder).catch(err => logErr('WA', `reconnect gagal | ${who(session)}`, err));
-          }
-        }, delay);
       }
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (session.socket !== sock) return;
-      log('MSG', `upsert type=${type} jumlah=${messages.length} | ${who(session)}`);
-      if (type !== 'notify') {
-        log('MSG', `SKIP type bukan notify (${type}) | ${who(session)}`);
-        return;
-      }
+      if (type !== 'notify') return;
       for (const msg of messages) {
         try { await handleIncoming(session, msg); }
-        catch (err) { logErr('MSG', `gagal memproses id=${msg?.key?.id} | ${who(session)}`, err); }
+        catch (err) { logger.error({ err, salesId: session.sales.salesId }, 'Gagal memproses chat masuk'); }
       }
     });
   } finally {
@@ -197,60 +176,23 @@ function getMessageText(msg) {
     || '';
 }
 
-function skip(session, reason, who2 = '') {
-  log('MSG', `SKIP ${reason}${who2 ? ` | ${who2}` : ''} | ${who(session)}`);
-}
-
 async function handleIncoming(session, msg) {
-  const salesId = session.sales.salesId;
-  if (!msg?.key) return skip(session, 'tidak ada key');
-
+  if (!msg?.key || msg.key.fromMe) return;
   const remoteJid = msg.key.remoteJid || '';
-  const altJid = msg.key.remoteJidAlt || msg.key.senderPn || '';
-  const msgId = msg.key.id;
-
-  if (msg.key.fromMe) return skip(session, 'pesan dari sales sendiri', remoteJid);
-  if (remoteJid.endsWith('@g.us')) return skip(session, 'grup');
-  if (remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast') return skip(session, 'broadcast/status');
-  if (remoteJid.endsWith('@newsletter')) return skip(session, 'newsletter');
-
-  // Tangani format LID: pakai nomor asli jika tersedia
-  let jid = remoteJid;
-  if (remoteJid.endsWith('@lid')) {
-    if (altJid.endsWith('@s.whatsapp.net')) {
-      jid = altJid;
-      log('MSG', `LID dipetakan ${remoteJid.split('@')[0]} -> ${altJid.split('@')[0]} | ${who(session)}`);
-    } else {
-      return skip(session, 'JID @lid tanpa nomor asli (remoteJidAlt/senderPn kosong)', remoteJid);
-    }
-  }
-  if (!jid.endsWith('@s.whatsapp.net')) return skip(session, 'JID bukan nomor personal', jid);
-
-  const phone = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
-  if (!phone) return skip(session, 'nomor kosong');
-  if (phone === session.phone) return skip(session, 'nomor sama dengan akun sales', phone);
+  // Abaikan grup, broadcast, status, dan JID non-nomor.
+  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) return;
+  if (!remoteJid.endsWith('@s.whatsapp.net')) return;
+  const phone = remoteJid.split('@')[0].replace(/\D/g, '');
+  if (!phone || phone === session.phone) return;
+  const messageKey = msg.key.id;
+  if (messageKey && !(await recordMessageOnce(session.sales.salesId, messageKey))) return;
 
   const text = getMessageText(msg).trim();
-  if (!text) {
-    return skip(session, `tanpa teks/caption (${Object.keys(msg.message || {}).join(',') || 'kosong'})`, phone);
-  }
-  log('MSG', `MASUK ${phone} "${cut(text)}" | ${who(session)}`);
-
-  // Ekstraksi DULU, baru tandai sebagai sudah diproses
+  if (!text) return; // Media tanpa caption tidak bisa diekstrak dengan aturan teks.
   const extracted = await extractLead({ text, pushName: msg.pushName || '', phone });
-  if (!extracted) return skip(session, 'bukan lead (tidak ada intent/kebutuhan/budget/referensi)', phone);
-
-  log(
-    'MSG',
-    `EKSTRAKSI ${phone} | nama=${extracted.nama || '-'} | kebutuhan=${extracted.kebutuhan || '-'} | budget=${extracted.budget || '-'} | ref=${cut(extracted.referensiLaptop, 30) || '-'} | ${who(session)}`
-  );
-
-  if (msgId && !(await recordMessageOnce(salesId, msgId))) {
-    return skip(session, 'duplikat (sudah pernah diproses)', phone);
-  }
-
+  if (!extracted) return;
   const result = await upsertLead({ sales: session.sales, extracted });
-  log('MSG', `SIMPAN ${result.action} ${phone} lead=${result.id} | ${who(session)}`);
+  logger.info({ salesId: session.sales.salesId, phone, action: result.action, leadId: result.id, kebutuhan: extracted.kebutuhan, budget: extracted.budget }, 'Lead diproses');
 }
 
 export async function disconnectSales(salesId, logout = false) {
@@ -262,13 +204,12 @@ export async function disconnectSales(salesId, logout = false) {
   try {
     if (logout) await s.socket?.logout();
     else s.socket?.end(undefined);
-  } catch (err) { logErr('WA', `penutupan sesi ${salesId}`, err); }
+  } catch (err) { logger.warn({ err, salesId }, 'Penutupan sesi'); }
   if (logout) {
     fs.rmSync(safeFolder(salesId), { recursive: true, force: true });
     sessions.delete(salesId);
   }
   saveMetadata();
-  log('WA', `${logout ? 'LOGOUT' : 'DISCONNECT'} ${salesId}`);
   return { salesId, disconnected: true, loggedOut: logout };
 }
 
@@ -278,13 +219,17 @@ export async function restoreSessions() {
   try {
     if (!fs.existsSync(metadataPath)) return;
     const entries = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-    log('WA', `memulihkan ${entries.length} sesi`);
     for (const item of entries) {
       if (item.enabled === false) continue;
-      const s = { sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch }, connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null };
+      const s = {
+        sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch },
+        connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
+        hasEverConnected: true,
+        lastRequestedAt: Date.now(),
+      };
       sessions.set(item.salesId, s);
       await startSocket(s, safeFolder(item.salesId));
     }
-  } catch (err) { logErr('WA', 'gagal memulihkan sesi', err); }
+  } catch (err) { logger.error({ err }, 'Gagal memulihkan sesi'); }
   finally { restoring = false; }
 }
