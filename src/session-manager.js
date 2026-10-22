@@ -210,6 +210,30 @@ function getMessageText(msg) {
     || '';
 }
 
+// WhatsApp "Linked ID" (@lid): format JID baru untuk kontak yang belum
+// tersimpan di address book pengirim (atau akun bisnis). Angka di depan
+// "@lid" BUKAN nomor telepon asli -- harus di-resolve dulu lewat mapping
+// internal Baileys. Nama API persis berbeda-beda antar versi Baileys
+// (fitur ini masih terus berubah di WhatsApp/Baileys), jadi dicoba
+// beberapa kemungkinan secara defensif. Kalau semua gagal, fungsi ini
+// mengembalikan null dan pesan akan di-skip dengan log yang jelas.
+async function resolvePhoneFromLid(sock, lidJid) {
+  try {
+    const mapping = sock?.signalRepository?.lidMapping;
+    const resolved =
+      (await mapping?.getPNForLID?.(lidJid)) ||
+      (await mapping?.getPNForLid?.(lidJid)) ||
+      null;
+    if (resolved) {
+      const phone = String(resolved).split('@')[0].replace(/\D/g, '');
+      return phone || null;
+    }
+  } catch (err) {
+    logError('MSG', 'Gagal resolve @lid ke nomor asli', err, lidJid);
+  }
+  return null;
+}
+
 async function handleIncoming(session, msg) {
   if (!msg?.key) {
     log('MSG', 'SKIP pesan tanpa key', label(session));
@@ -224,17 +248,25 @@ async function handleIncoming(session, msg) {
     log('MSG', 'SKIP grup/broadcast/status', `${label(session)} | jid=${remoteJid}`);
     return;
   }
-  if (!remoteJid.endsWith('@s.whatsapp.net')) {
-    // Ini titik penting untuk diagnosis: WhatsApp kadang mengirim JID
-    // dengan format lain (mis. "@lid" untuk kontak yang belum tersimpan
-    // di address book di WA versi baru), yang tidak match pola
-    // "@s.whatsapp.net" -- kalau log ini sering muncul, berarti chat
-    // masuk tapi diabaikan gara-gara format JID-nya, bukan karena
-    // ekstraksinya gagal.
+
+  let phone = null;
+
+  if (remoteJid.endsWith('@s.whatsapp.net')) {
+    phone = remoteJid.split('@')[0].replace(/\D/g, '');
+  } else if (remoteJid.endsWith('@lid')) {
+    // Coba resolve LID -> nomor asli dulu sebelum di-skip.
+    phone = await resolvePhoneFromLid(session.socket, remoteJid);
+    if (phone) {
+      log('MSG', 'Berhasil resolve @lid ke nomor asli', `${label(session)} | lid=${remoteJid} -> ${phone}`);
+    } else {
+      log('MSG', 'SKIP @lid tidak bisa di-resolve ke nomor asli', `${label(session)} | jid=${remoteJid}`);
+      return;
+    }
+  } else {
     log('MSG', 'SKIP format JID tidak dikenali', `${label(session)} | jid=${remoteJid}`);
     return;
   }
-  const phone = remoteJid.split('@')[0].replace(/\D/g, '');
+
   if (!phone) {
     log('MSG', 'SKIP nomor kosong setelah parsing JID', `${label(session)} | jid=${remoteJid}`);
     return;
