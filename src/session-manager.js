@@ -61,12 +61,16 @@ export function getSession(salesId) { const s = sessions.get(salesId); return s 
 export function getQr(salesId) {
   const s = sessions.get(salesId);
   if (!s) return null;
-  touchSession(salesId); // sales lagi lihat/minta QR -> perpanjang jam idle
+  // SENGAJA tidak touchSession() di sini -- ini dipanggil oleh polling
+  // background tiap 3 detik dari app, kalau ikut memperpanjang jam idle
+  // maka QR akan terus dibuat ulang selama halaman terbuka, walau sales
+  // sudah tidak aktif. Jam idle hanya diperpanjang oleh AKSI EKSPLISIT
+  // (tombol "Tampilkan QR" / "Muat ulang QR" ditekan), lihat connectSales().
   return s.qr || null;
 }
 
-// Dipanggil setiap kali ada aktivitas sales yang menandakan dia masih
-// menunggu untuk scan QR (buka halaman, polling status, polling QR).
+// Dipanggil hanya dari aksi eksplisit sales (tekan tombol connect),
+// BUKAN dari polling pasif -- lihat komentar di getQr().
 export function touchSession(salesId) {
   const s = sessions.get(salesId);
   if (s) s.lastRequestedAt = Date.now();
@@ -209,10 +213,23 @@ async function handleIncoming(session, msg) {
 
   const text = getMessageText(msg).trim();
   if (!text) return; // Media tanpa caption tidak bisa diekstrak dengan aturan teks.
+
+  const preview = text.length > 80 ? text.slice(0, 80) + '...' : text;
+  log('CHAT', `masuk dari ${phone}`, `${session.sales.branch} | "${preview}"`);
+
   const extracted = await extractLead({ text, pushName: msg.pushName || '', phone });
-  if (!extracted) return;
+  if (!extracted) {
+    log('CHAT', 'diabaikan (tidak dikenali sebagai lead)', `${phone} | ${session.sales.branch}`);
+    return;
+  }
+
+  const method = extracted.extractionMethod === 'gemini' ? 'AI Gemini' : 'aturan kata kunci (fallback)';
   const result = await upsertLead({ sales: session.sales, extracted });
-  log('LEAD', `${result.action} id=${result.id}`, `${phone} | kebutuhan=${extracted.kebutuhan || '-'} budget=${extracted.budget || '-'}`);
+  log(
+    'LEAD',
+    `${result.action} id=${result.id} via ${method}`,
+    `${phone} | ${session.sales.branch} | nama=${extracted.nama || '-'} kebutuhan=${extracted.kebutuhan || '-'} budget=${extracted.budget || '-'} referensi=${extracted.referensiLaptop || '-'}`
+  );
 }
 
 export async function disconnectSales(salesId, logout = false) {
