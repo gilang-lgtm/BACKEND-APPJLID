@@ -165,6 +165,24 @@ async function startSocket(session, folder) {
     session.socket = sock;
     sock.ev.on('creds.update', saveCreds);
 
+    // Belajar pasangan lid -> nomor dari event WhatsApp (best-effort).
+    if (!session.lidMap) session.lidMap = new Map();
+    try {
+      sock.ev.on('lid-mapping.update', (u) => {
+        for (const m of [].concat(u || [])) rememberLid(session, m?.lid, m?.pn);
+      });
+      const onContacts = (contacts) => {
+        for (const c of contacts || []) {
+          if (String(c?.id || '').endsWith('@lid')) rememberLid(session, c.id, c.phoneNumber);
+          else if (c?.lid) rememberLid(session, c.lid, c.id);
+        }
+      };
+      sock.ev.on('contacts.upsert', onContacts);
+      sock.ev.on('contacts.update', onContacts);
+    } catch (err) {
+      logError('WA', 'Gagal memasang listener lid-mapping', err);
+    }
+
     sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
       if (qr) {
         try {
@@ -234,23 +252,63 @@ function getMessageText(msg) {
     || '';
 }
 
-// WhatsApp "Linked ID" (@lid): format JID baru untuk kontak yang belum
-// tersimpan di address book pengirim (atau akun bisnis). Angka di depan
-// "@lid" BUKAN nomor telepon asli -- harus di-resolve dulu lewat mapping
-// internal Baileys. Nama API persis berbeda-beda antar versi Baileys
-// (fitur ini masih terus berubah di WhatsApp/Baileys), jadi dicoba
-// beberapa kemungkinan secara defensif. Kalau semua gagal, fungsi ini
-// mengembalikan null dan pesan akan di-skip dengan log yang jelas.
-async function resolvePhoneFromLid(sock, lidJid) {
+// ------------------------------------------------------------
+// RESOLVE @lid -> NOMOR WA ASLI
+// WhatsApp kadang mengirim chat dari "ID tersembunyi" (@lid), bukan nomor.
+// Nomor asli dicari dari beberapa sumber, berurutan:
+//  1) field bawaan di key pesan (Baileys v7: remoteJidAlt, Baileys 6.x: senderPn/participantPn)
+//  2) cache pasangan lid -> nomor yang dipelajari dari event (lid-mapping.update, contacts)
+//  3) lidMapping bawaan Baileys (getPNForLID, hanya ada di Baileys v7)
+// Kalau semua gagal, WhatsApp memang belum/tidak mengirim nomornya.
+// ------------------------------------------------------------
+function jidUser(jid) {
+  return String(jid || '').split('@')[0].split(':')[0];
+}
+
+function phoneFromJid(jid) {
+  const j = String(jid || '');
+  if (!j) return null;
+  if (j.includes('@') && !j.endsWith('@s.whatsapp.net')) return null;
+  const digits = jidUser(j).replace(/\D/g, '');
+  return digits.length >= 8 ? digits : null;
+}
+
+function rememberLid(session, lidJid, pnJid) {
   try {
-    const mapping = sock?.signalRepository?.lidMapping;
+    const phone = phoneFromJid(pnJid);
+    const lidKey = jidUser(lidJid);
+    if (!session.lidMap) session.lidMap = new Map();
+    if (phone && lidKey && String(lidJid).includes('@lid')) session.lidMap.set(lidKey, phone);
+  } catch { /* abaikan */ }
+}
+
+async function resolvePhoneFromLid(session, msg, lidJid) {
+  const key = msg?.key || {};
+
+  // 1) Field bawaan di pesan
+  for (const candidate of [key.remoteJidAlt, key.senderPn, key.participantPn, key.participantAlt, msg?.senderPn]) {
+    const p = phoneFromJid(candidate);
+    if (p) {
+      rememberLid(session, lidJid, candidate);
+      return p;
+    }
+  }
+
+  // 2) Cache dari event sebelumnya
+  const cached = session.lidMap?.get(jidUser(lidJid));
+  if (cached) return cached;
+
+  // 3) Mapping bawaan Baileys v7
+  try {
+    const mapping = session.socket?.signalRepository?.lidMapping;
     const resolved =
       (await mapping?.getPNForLID?.(lidJid)) ||
       (await mapping?.getPNForLid?.(lidJid)) ||
       null;
-    if (resolved) {
-      const phone = String(resolved).split('@')[0].replace(/\D/g, '');
-      return phone || null;
+    const p = phoneFromJid(resolved) || (resolved ? String(resolved).replace(/\D/g, '') : null);
+    if (p) {
+      rememberLid(session, lidJid, `${p}@s.whatsapp.net`);
+      return p;
     }
   } catch (err) {
     logError('MSG', 'Gagal resolve @lid ke nomor asli', err, lidJid);
@@ -276,16 +334,20 @@ async function handleIncoming(session, msg) {
   let phone = null;
   if (remoteJid.endsWith('@s.whatsapp.net')) {
     phone = remoteJid.split('@')[0].replace(/\D/g, '');
+    if (String(msg.key.remoteJidAlt || '').endsWith('@lid')) {
+      rememberLid(session, msg.key.remoteJidAlt, remoteJid);
+    }
   } else if (remoteJid.endsWith('@lid')) {
-    phone = await resolvePhoneFromLid(session.socket, remoteJid);
+    phone = await resolvePhoneFromLid(session, msg, remoteJid);
     if (!phone) {
-      // Chat pelanggan asli yang tidak bisa diproses -- tetap dicatat.
+      // Chat pelanggan asli yang tidak bisa diproses -- tetap dicatat,
+      // lengkap dengan isi key pesan untuk bantu diagnosa.
       logChat({
         session,
         phone: remoteJid,
         text,
         masuk: false,
-        hasil: 'alasan=ID WhatsApp (@lid) tidak bisa diubah ke nomor asli',
+        hasil: `alasan=nomor asli tidak dikirim WhatsApp (ID @lid) | key=${JSON.stringify(msg.key)}`,
       });
       return;
     }
