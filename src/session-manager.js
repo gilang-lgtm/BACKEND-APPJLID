@@ -220,14 +220,27 @@ function getMessageText(msg) {
 async function resolvePhoneFromLid(sock, lidJid) {
   try {
     const mapping = sock?.signalRepository?.lidMapping;
+    if (!mapping) {
+      // Diagnostik: supaya ketahuan apakah memang versi Baileys yang
+      // terpasang tidak punya signalRepository.lidMapping sama sekali,
+      // atau cuma nama propertinya beda.
+      const repoKeys = sock?.signalRepository ? Object.keys(sock.signalRepository) : null;
+      log('MSG', 'DEBUG @lid: signalRepository.lidMapping tidak ada', `ada signalRepository=${Boolean(sock?.signalRepository)} | keys=${repoKeys ? repoKeys.join(',') : '-'}`);
+      return null;
+    }
+    const mappingKeys = Object.keys(mapping);
     const resolved =
-      (await mapping?.getPNForLID?.(lidJid)) ||
-      (await mapping?.getPNForLid?.(lidJid)) ||
+      (await mapping.getPNForLID?.(lidJid)) ||
+      (await mapping.getPNForLid?.(lidJid)) ||
+      (await mapping.getPNForLIDSync?.(lidJid)) ||
       null;
     if (resolved) {
       const phone = String(resolved).split('@')[0].replace(/\D/g, '');
       return phone || null;
     }
+    // Diagnostik: mapping ada, tapi tidak ada method yang cocok ATAU
+    // method yang dicoba mengembalikan kosong/null untuk JID ini.
+    log('MSG', 'DEBUG @lid: lidMapping ada tapi tidak dapat nomor', `lidMapping keys=${mappingKeys.join(',')} | jid=${lidJid}`);
   } catch (err) {
     logError('MSG', 'Gagal resolve @lid ke nomor asli', err, lidJid);
   }
