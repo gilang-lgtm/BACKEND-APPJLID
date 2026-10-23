@@ -257,6 +257,15 @@ async function resolvePhoneFromLid(sock, msg) {
 }
 
 async function handleIncoming(session, msg) {
+  // Diagnostik paling awal -- supaya kelihatan kalaupun pesan ke-skip di
+  // pengecekan paling pertama (fromMe, tanpa key, dll), yang mana sebelum
+  // ini TIDAK ada log-nya sama sekali kalau ke-skip di sini.
+  log(
+    'MSG',
+    'DEBUG diterima',
+    `${label(session)} | hasKey=${Boolean(msg?.key)} | fromMe=${msg?.key?.fromMe} | remoteJid=${msg?.key?.remoteJid || '-'} | msgTypeKeys=${msg?.message ? Object.keys(msg.message).join(',') : '(tanpa field message)'}`
+  );
+
   if (!msg?.key || msg.key.fromMe) return;
   const remoteJid = msg.key.remoteJid || '';
   if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
