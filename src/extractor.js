@@ -5,10 +5,11 @@
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-// Dinaikkan dari 8 detik -> 15 detik: 8 detik kadang kurang untuk koneksi
-// dari host hosting ke API Google, bikin keseringan abort padahal
-// sebenarnya cuma lambat, bukan benar-benar gagal.
-const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 15000);
+// Setelah thinkingConfig.thinkingBudget dimatikan (lihat callGeminiOnce),
+// respons Gemini seharusnya cuma butuh beberapa detik. Sebelumnya 15000ms
+// sering kurang karena model diam-diam "mikir" sampai puluhan detik --
+// bukan soal network. 12 detik dikasih sedikit ruang jaga-jaga.
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 12000);
 
 // ====================================================================
 // METODE LAMA: aturan kata kunci (FALLBACK saja -- dipakai kalau
@@ -127,7 +128,15 @@ async function callGeminiOnce({ text, pushName, phone, timeoutMs }) {
           parts: [{ text: `Nama kontak WhatsApp (bisa jadi bukan nama asli): "${pushName || '(tidak ada)'}"\nPesan: "${text}"` }],
         },
       ],
-      generationConfig: { temperature: 0, responseMimeType: 'application/json' },
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: 'application/json',
+        // Matikan "extended thinking" -- tugas ekstraksi ini sederhana dan
+        // butuh respons cepat. Tanpa ini, model bisa mikir puluhan detik
+        // (terbukti: 1 panggilan tes memakan ~36 detik, jauh di atas
+        // timeout kita) padahal hasilnya sama saja untuk tugas sesimpel ini.
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     };
 
     const res = await fetch(url, {
@@ -183,6 +192,11 @@ async function extractLeadWithGemini({ text, pushName, phone }) {
   return last;
 }
 
+// ====================================================================
+// FUNGSI UTAMA yang dipanggil dari session-manager.js (WAJIB pakai await)
+// Mengembalikan: { lead: {...} | null, method: 'gemini' | 'rule-based',
+//                   fallbackReason: string | null }
+// ====================================================================
 
 export async function extractLead({ text = '', pushName = '', phone = '' }) {
   const normalized = String(text).replace(/‎|‏/g, ' ').trim();
