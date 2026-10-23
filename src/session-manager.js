@@ -6,14 +6,7 @@ import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeys
 import { config } from './config.js';
 import { extractLead } from './extractor.js';
 import { recordMessageOnce, upsertLead } from './firestore-leads.js';
-
-// Logger KHUSUS untuk Baileys -- dibikin silent supaya log internal
-// socket/websocket yang super detail (ratusan baris JSON teknis) tidak
-// membanjiri log server. Logger ini TIDAK dipakai untuk log aplikasi kita.
 const baileysLogger = pino({ level: 'silent' });
-
-// Log aplikasi sendiri -- sengaja dibuat simpel & gampang dibaca,
-// format: [TAG] pesan | detail
 function log(tag, message, detail) {
   const line = detail ? `[${tag}] ${message} | ${detail}` : `[${tag}] ${message}`;
   console.log(line);
