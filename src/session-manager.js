@@ -217,33 +217,42 @@ function getMessageText(msg) {
 // (fitur ini masih terus berubah di WhatsApp/Baileys), jadi dicoba
 // beberapa kemungkinan secara defensif. Kalau semua gagal, fungsi ini
 // mengembalikan null dan pesan akan di-skip dengan log yang jelas.
-async function resolvePhoneFromLid(sock, lidJid) {
+async function resolvePhoneFromLid(sock, msg) {
+  const key = msg.key || {};
+  const lidJid = key.remoteJid || '';
+
+  // Cara 1: beberapa versi Baileys menaruh versi nomor-telepon-asli
+  // berdampingan dengan JID @lid, langsung di field pesan itu sendiri
+  // (nama field berbeda-beda antar versi, dicoba semua kemungkinan).
+  const altCandidates = [key.remoteJidAlt, key.senderPn, key.participantAlt, key.participantPn, msg.verifiedBizName];
+  for (const candidate of altCandidates) {
+    if (typeof candidate === 'string' && candidate.endsWith('@s.whatsapp.net')) {
+      const phone = candidate.split('@')[0].replace(/\D/g, '');
+      if (phone) return phone;
+    }
+  }
+
+  // Cara 2: lewat signalRepository.lidMapping (kalau versi Baileys-nya
+  // mendukung -- diketahui dari log DEBUG sebelumnya versi kamu TIDAK
+  // punya ini, tapi tetap dicoba untuk jaga-jaga kalau nanti di-update).
   try {
     const mapping = sock?.signalRepository?.lidMapping;
-    if (!mapping) {
-      // Diagnostik: supaya ketahuan apakah memang versi Baileys yang
-      // terpasang tidak punya signalRepository.lidMapping sama sekali,
-      // atau cuma nama propertinya beda.
-      const repoKeys = sock?.signalRepository ? Object.keys(sock.signalRepository) : null;
-      log('MSG', 'DEBUG @lid: signalRepository.lidMapping tidak ada', `ada signalRepository=${Boolean(sock?.signalRepository)} | keys=${repoKeys ? repoKeys.join(',') : '-'}`);
-      return null;
-    }
-    const mappingKeys = Object.keys(mapping);
     const resolved =
-      (await mapping.getPNForLID?.(lidJid)) ||
-      (await mapping.getPNForLid?.(lidJid)) ||
-      (await mapping.getPNForLIDSync?.(lidJid)) ||
+      (await mapping?.getPNForLID?.(lidJid)) ||
+      (await mapping?.getPNForLid?.(lidJid)) ||
       null;
     if (resolved) {
       const phone = String(resolved).split('@')[0].replace(/\D/g, '');
-      return phone || null;
+      if (phone) return phone;
     }
-    // Diagnostik: mapping ada, tapi tidak ada method yang cocok ATAU
-    // method yang dicoba mengembalikan kosong/null untuk JID ini.
-    log('MSG', 'DEBUG @lid: lidMapping ada tapi tidak dapat nomor', `lidMapping keys=${mappingKeys.join(',')} | jid=${lidJid}`);
   } catch (err) {
-    logError('MSG', 'Gagal resolve @lid ke nomor asli', err, lidJid);
+    logError('MSG', 'Gagal resolve @lid lewat lidMapping', err, lidJid);
   }
+
+  // Semua cara gagal -- dump seluruh field di key pesan (bukan seluruh
+  // pesan, supaya tidak kepanjangan) supaya kelihatan field apa saja yang
+  // sebenarnya dikirim WhatsApp untuk pesan @lid ini.
+  log('MSG', 'DEBUG @lid: semua cara resolve gagal, isi msg.key', JSON.stringify(key));
   return null;
 }
 
@@ -263,7 +272,7 @@ async function handleIncoming(session, msg) {
   if (remoteJid.endsWith('@s.whatsapp.net')) {
     phone = remoteJid.split('@')[0].replace(/\D/g, '');
   } else if (remoteJid.endsWith('@lid')) {
-    phone = await resolvePhoneFromLid(session.socket, remoteJid);
+    phone = await resolvePhoneFromLid(session.socket, msg);
     if (!phone) phoneIssue = 'gagal resolve @lid';
   } else {
     phoneIssue = `jid tidak dikenali (${remoteJid})`;
