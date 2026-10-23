@@ -6,7 +6,14 @@ import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeys
 import { config } from './config.js';
 import { extractLead } from './extractor.js';
 import { recordMessageOnce, upsertLead } from './firestore-leads.js';
+
+// Logger KHUSUS untuk Baileys -- dibikin silent supaya log internal
+// socket/websocket yang super detail (ratusan baris JSON teknis) tidak
+// membanjiri log server. Logger ini TIDAK dipakai untuk log aplikasi kita.
 const baileysLogger = pino({ level: 'silent' });
+
+// Log aplikasi sendiri -- sengaja dibuat simpel & gampang dibaca,
+// format: [TAG] pesan | detail
 function log(tag, message, detail) {
   const line = detail ? `[${tag}] ${message} | ${detail}` : `[${tag}] ${message}`;
   console.log(line);
@@ -228,89 +235,56 @@ async function resolvePhoneFromLid(sock, lidJid) {
 }
 
 async function handleIncoming(session, msg) {
-  if (!msg?.key) {
-    log('MSG', 'SKIP pesan tanpa key', label(session));
-    return;
-  }
-  if (msg.key.fromMe) {
-    log('MSG', 'SKIP pesan dari diri sendiri (fromMe)', label(session));
-    return;
-  }
+  if (!msg?.key || msg.key.fromMe) return;
   const remoteJid = msg.key.remoteJid || '';
   if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
-    log('MSG', 'SKIP grup/broadcast/status', `${label(session)} | jid=${remoteJid}`);
     return;
   }
 
-  // Ambil & tampilkan isi pesan SEDINI MUNGKIN -- supaya isi chat yang
-  // masuk tetap kelihatan jelas di log, walaupun nanti pesannya di-SKIP
-  // karena masalah nomor/JID (mis. @lid gagal di-resolve). Sebelumnya log
-  // isi pesan baru muncul di akhir, jadi kalau pesan ke-skip di tengah
-  // jalan (misalnya kasus @lid "kerja" kemarin), isi chatnya sama sekali
-  // tidak kelihatan di log.
   const text = getMessageText(msg).trim();
-  log(
-    'CHAT',
-    'isi pesan masuk',
-    `${label(session)} | jid=${remoteJid} | pushName="${msg.pushName || '-'}" | text="${text || '(tanpa teks/caption -- media/gambar/stiker, dll)'}"`
-  );
 
+  // Resolve nomor pengirim dari JID. Untuk @lid (kontak belum tersimpan
+  // di address book), angka di JID BUKAN nomor asli -- coba resolve dulu.
   let phone = null;
-
+  let phoneIssue = null;
   if (remoteJid.endsWith('@s.whatsapp.net')) {
     phone = remoteJid.split('@')[0].replace(/\D/g, '');
   } else if (remoteJid.endsWith('@lid')) {
-    // Coba resolve LID -> nomor asli dulu sebelum di-skip.
     phone = await resolvePhoneFromLid(session.socket, remoteJid);
-    if (phone) {
-      log('MSG', 'Berhasil resolve @lid ke nomor asli', `${label(session)} | lid=${remoteJid} -> ${phone}`);
-    } else {
-      log('MSG', 'SKIP @lid tidak bisa di-resolve ke nomor asli (isi pesan di atas)', `${label(session)} | jid=${remoteJid}`);
-      return;
-    }
+    if (!phone) phoneIssue = 'gagal resolve @lid';
   } else {
-    log('MSG', 'SKIP format JID tidak dikenali (isi pesan di atas)', `${label(session)} | jid=${remoteJid}`);
-    return;
+    phoneIssue = `jid tidak dikenali (${remoteJid})`;
   }
 
-  if (!phone) {
-    log('MSG', 'SKIP nomor kosong setelah parsing JID', `${label(session)} | jid=${remoteJid}`);
-    return;
-  }
-  if (phone === session.phone) {
-    log('MSG', 'SKIP nomor sama dengan nomor toko sendiri', `${label(session)} | ${phone}`);
-    return;
-  }
-  const messageKey = msg.key.id;
-  if (messageKey && !(await recordMessageOnce(session.sales.salesId, messageKey))) {
-    log('MSG', 'SKIP sudah pernah diproses sebelumnya (duplikat)', `${label(session)} | ${phone} | id=${messageKey}`);
-    return;
+  let skip = null;
+  if (!phone) skip = phoneIssue || 'nomor tidak diketahui';
+  else if (phone === session.phone) skip = 'nomor sama dengan nomor toko sendiri';
+  else if (msg.key.id && !(await recordMessageOnce(session.sales.salesId, msg.key.id))) skip = 'duplikat, sudah pernah diproses';
+  else if (!text) skip = 'tanpa teks/caption (media)';
+
+  let extracted = null;
+  let method = null;
+  let fallbackReason = null;
+  if (!skip) {
+    ({ lead: extracted, method, fallbackReason } = await extractLead({ text, pushName: msg.pushName || '', phone }));
   }
 
-  if (!text) {
-    log('MSG', 'SKIP media tanpa teks/caption (gambar, voice note, stiker, dll)', `${label(session)} | ${phone}`);
-    return;
-  }
+  const methodLabel = method === 'gemini' ? 'gemini' : 'manual';
+  const diextrak = skip
+    ? `tidak diproses (${skip})`
+    : !extracted
+      ? `diabaikan, bukan lead (${methodLabel}${fallbackReason ? `, gemini gagal: ${fallbackReason}` : ''})`
+      : `${methodLabel}${fallbackReason ? ` (gemini gagal: ${fallbackReason})` : ''}`;
 
-  const { lead: extracted, method, fallbackReason } = await extractLead({ text, pushName: msg.pushName || '', phone });
+  // Satu baris ringkas per pesan masuk: isi pesan, nomor wa, hasil ekstraksi.
+  log('CHAT', `pesan masuk="${text || '-'}"`, `no wa=${phone || '-'} | ${label(session)} | diextrak=${diextrak}`);
 
-  const methodLabel = method === 'gemini' ? 'AI Gemini' : 'aturan kata kunci (fallback)';
-  if (fallbackReason) {
-    // Gemini gagal dipanggil -- alasannya ditulis langsung di log utama
-    // (bukan cuma di error log) supaya gampang ketahuan kalau Gemini
-    // sering gagal dan keseringan jatuh ke fallback yang lebih kaku.
-    log('CHAT', `Gemini gagal, pakai fallback (${fallbackReason})`, `${phone} | ${session.sales.branch}`);
-  }
-
-  if (!extracted) {
-    log('CHAT', `diabaikan, tidak dikenali sebagai lead (via ${methodLabel})`, `${phone} | ${session.sales.branch}`);
-    return;
-  }
+  if (skip || !extracted) return;
 
   const result = await upsertLead({ sales: session.sales, extracted });
   log(
     'LEAD',
-    `${result.action} id=${result.id} via ${methodLabel}`,
+    `${result.action} id=${result.id}`,
     `${phone} | ${session.sales.branch} | nama=${extracted.nama || '-'} kebutuhan=${extracted.kebutuhan || '-'} budget=${extracted.budget || '-'} referensi=${extracted.referensiLaptop || '-'}`
   );
 }
@@ -344,7 +318,11 @@ export async function restoreSessions() {
       const s = {
         sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch },
         connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
-       
+        // JANGAN di-hardcode true di sini -- startSocket() di bawah akan
+        // menentukan nilai sebenarnya dari creds.registered begitu folder
+        // sesinya dibaca. Sesi yang BELUM pernah discan (creds.registered
+        // masih false) harus tetap tunduk ke jam idle, bukan dianggap
+        // "sudah terhubung" cuma karena pernah tersimpan di metadata.
         hasEverConnected: false,
         lastRequestedAt: Date.now(),
       };
