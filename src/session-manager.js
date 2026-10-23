@@ -7,8 +7,13 @@ import { config } from './config.js';
 import { extractLead } from './extractor.js';
 import { recordMessageOnce, upsertLead } from './firestore-leads.js';
 
+// Logger KHUSUS untuk Baileys -- dibikin silent supaya log internal
+// socket/websocket yang super detail (ratusan baris JSON teknis) tidak
+// membanjiri log server. Logger ini TIDAK dipakai untuk log aplikasi kita.
 const baileysLogger = pino({ level: 'silent' });
 
+// Log aplikasi sendiri -- sengaja dibuat simpel & gampang dibaca,
+// format: [TAG] pesan | detail
 function log(tag, message, detail) {
   const line = detail ? `[${tag}] ${message} | ${detail}` : `[${tag}] ${message}`;
   console.log(line);
@@ -22,6 +27,10 @@ function logError(tag, message, err, detail) {
 const sessions = new Map();
 const metadataPath = path.join(config.dataDir, 'sales-sessions.json');
 let restoring = false;
+
+// Kalau tidak ada yang minta/cek QR selama ini (sales menutup halaman
+// "Tautkan WhatsApp"), hentikan loop reconnect-buat-QR otomatis supaya
+// tidak jalan terus-menerus di background tanpa guna.
 const QR_IDLE_TIMEOUT_MS = Number(process.env.QR_IDLE_TIMEOUT_MS || 90000);
 
 fs.mkdirSync(config.sessionsDir, { recursive: true });
@@ -52,9 +61,16 @@ export function getSession(salesId) { const s = sessions.get(salesId); return s 
 export function getQr(salesId) {
   const s = sessions.get(salesId);
   if (!s) return null;
+  // SENGAJA tidak touchSession() di sini -- ini dipanggil oleh polling
+  // background tiap 3 detik dari app, kalau ikut memperpanjang jam idle
+  // maka QR akan terus dibuat ulang selama halaman terbuka, walau sales
+  // sudah tidak aktif. Jam idle hanya diperpanjang oleh AKSI EKSPLISIT
+  // (tombol "Tampilkan QR" / "Muat ulang QR" ditekan), lihat connectSales().
   return s.qr || null;
 }
 
+// Dipanggil hanya dari aksi eksplisit sales (tekan tombol connect),
+// BUKAN dari polling pasif -- lihat komentar di getQr().
 export function touchSession(salesId) {
   const s = sessions.get(salesId);
   if (s) s.lastRequestedAt = Date.now();
@@ -94,6 +110,13 @@ async function startSocket(session, folder) {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(folder);
 
+    // `creds.registered` adalah penanda resmi dari Baileys: true hanya
+    // kalau proses pairing WA ini PERNAH berhasil sebelumnya (file
+    // kredensial valid tersimpan di folder sesi). Dipakai untuk membedakan
+    // sesi yang "sudah pernah discan sales" (boleh auto-reconnect terus
+    // walau idle, wajar dipulihkan kalau cuma putus jaringan) dari sesi
+    // yang "belum pernah discan sama sekali" (harus tunduk ke jam idle,
+    // supaya tidak auto-generate QR selamanya tanpa ada yang minta).
     if (state.creds?.registered) {
       session.hasEverConnected = true;
     }
@@ -136,12 +159,18 @@ async function startSocket(session, folder) {
           return; // sesi memang dimatikan / logout -- jangan reconnect
         }
 
+        // Sesi yang SUDAH PERNAH terhubung tetap direconnect otomatis
+        // seperti biasa -- wajar dipulihkan kalau cuma putus jaringan.
         if (session.hasEverConnected) {
           log('WA', 'reconnect dalam 3 dtk', label(session));
           setTimeout(() => startSocket(session, folder).catch(err => logError('WA', 'Reconnect gagal', err, label(session))), 3000);
           return;
         }
 
+        // Sesi BELUM PERNAH terhubung -- hanya lanjut buat QR baru kalau
+        // masih ada yang aktif minta/lihat QR dalam QR_IDLE_TIMEOUT_MS
+        // terakhir. Kalau tidak, berhenti sampai sales buka lagi
+        // halamannya / tekan tombol "Tampilkan QR".
         const idleFor = Date.now() - (session.lastRequestedAt || 0);
         if (idleFor < QR_IDLE_TIMEOUT_MS) {
           log('WA', 'reconnect dalam 3 dtk', label(session));
@@ -181,6 +210,13 @@ function getMessageText(msg) {
     || '';
 }
 
+// WhatsApp "Linked ID" (@lid): format JID baru untuk kontak yang belum
+// tersimpan di address book pengirim (atau akun bisnis). Angka di depan
+// "@lid" BUKAN nomor telepon asli -- harus di-resolve dulu lewat mapping
+// internal Baileys. Nama API persis berbeda-beda antar versi Baileys
+// (fitur ini masih terus berubah di WhatsApp/Baileys), jadi dicoba
+// beberapa kemungkinan secara defensif. Kalau semua gagal, fungsi ini
+// mengembalikan null dan pesan akan di-skip dengan log yang jelas.
 async function resolvePhoneFromLid(sock, lidJid) {
   try {
     const mapping = sock?.signalRepository?.lidMapping;
@@ -213,6 +249,19 @@ async function handleIncoming(session, msg) {
     return;
   }
 
+  // Ambil & tampilkan isi pesan SEDINI MUNGKIN -- supaya isi chat yang
+  // masuk tetap kelihatan jelas di log, walaupun nanti pesannya di-SKIP
+  // karena masalah nomor/JID (mis. @lid gagal di-resolve). Sebelumnya log
+  // isi pesan baru muncul di akhir, jadi kalau pesan ke-skip di tengah
+  // jalan (misalnya kasus @lid "kerja" kemarin), isi chatnya sama sekali
+  // tidak kelihatan di log.
+  const text = getMessageText(msg).trim();
+  log(
+    'CHAT',
+    'isi pesan masuk',
+    `${label(session)} | jid=${remoteJid} | pushName="${msg.pushName || '-'}" | text="${text || '(tanpa teks/caption -- media/gambar/stiker, dll)'}"`
+  );
+
   let phone = null;
 
   if (remoteJid.endsWith('@s.whatsapp.net')) {
@@ -223,11 +272,11 @@ async function handleIncoming(session, msg) {
     if (phone) {
       log('MSG', 'Berhasil resolve @lid ke nomor asli', `${label(session)} | lid=${remoteJid} -> ${phone}`);
     } else {
-      log('MSG', 'SKIP @lid tidak bisa di-resolve ke nomor asli', `${label(session)} | jid=${remoteJid}`);
+      log('MSG', 'SKIP @lid tidak bisa di-resolve ke nomor asli (isi pesan di atas)', `${label(session)} | jid=${remoteJid}`);
       return;
     }
   } else {
-    log('MSG', 'SKIP format JID tidak dikenali', `${label(session)} | jid=${remoteJid}`);
+    log('MSG', 'SKIP format JID tidak dikenali (isi pesan di atas)', `${label(session)} | jid=${remoteJid}`);
     return;
   }
 
@@ -245,18 +294,18 @@ async function handleIncoming(session, msg) {
     return;
   }
 
-  const text = getMessageText(msg).trim();
   if (!text) {
     log('MSG', 'SKIP media tanpa teks/caption (gambar, voice note, stiker, dll)', `${label(session)} | ${phone}`);
     return;
   }
 
-  log('CHAT', `masuk dari ${phone}`, `${session.sales.branch} | "${text}"`);
-
   const { lead: extracted, method, fallbackReason } = await extractLead({ text, pushName: msg.pushName || '', phone });
 
   const methodLabel = method === 'gemini' ? 'AI Gemini' : 'aturan kata kunci (fallback)';
   if (fallbackReason) {
+    // Gemini gagal dipanggil -- alasannya ditulis langsung di log utama
+    // (bukan cuma di error log) supaya gampang ketahuan kalau Gemini
+    // sering gagal dan keseringan jatuh ke fallback yang lebih kaku.
     log('CHAT', `Gemini gagal, pakai fallback (${fallbackReason})`, `${phone} | ${session.sales.branch}`);
   }
 
