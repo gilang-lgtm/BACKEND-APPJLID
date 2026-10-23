@@ -24,6 +24,91 @@ function logError(tag, message, err, detail) {
   console.error(line);
 }
 
+// ============================================================
+// LOG CHAT DETAIL
+// Satu blok log per chat masuk, berisi: waktu, sales/cabang,
+// pengirim, ISI PESAN, kategori hasil ekstraksi, metode yang dipakai,
+// dan hasil akhirnya (MASUK LEADS atau TIDAK + alasannya).
+//
+// Contoh keluaran:
+// ┌── CHAT MASUK ── 22/10/2026 14.03.11
+// │ Sales    : Budi / Bekasi
+// │ Pengirim : 6281234567890 (Rina)
+// │ Pesan    : halo kak, ada laptop asus buat kuliah budget 5jt?
+// │ Kategori : Nama: Rina | Kebutuhan: Kuliah | Budget: 5 Jutaan | Referensi: Asus
+// │ Metode   : AI Gemini
+// │ Hasil    : ✅ MASUK LEADS — lead BARU dibuat (id=abc123)
+// └────────────────────────────────────────
+//
+// Pesan yang tidak relevan (grup, status, pesan keluar, duplikat, dll)
+// dicatat satu baris saja supaya log tidak penuh.
+// ============================================================
+const LOG_PAD = '│' + ' '.repeat(12); // rata dengan "│ Pesan    : "
+
+function nowWib() {
+  return new Date().toLocaleString('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    hour12: false,
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function indentBlock(text) {
+  return String(text).split(/\r?\n/).join('\n' + LOG_PAD);
+}
+
+function logChat(e) {
+  const sender = e.sender || '-';
+
+  // Mode ringkas: satu baris untuk pesan yang memang tidak diproses.
+  if (e.compact) {
+    const teks = e.text ? `"${String(e.text).replace(/\s+/g, ' ')}"` : '(tanpa teks)';
+    console.log(`[CHAT] ⛔ SKIP (${e.kategori}) | ${label(e.session)} | ${sender} | ${teks}`);
+    return;
+  }
+
+  const verdict = e.masuk
+    ? `✅ MASUK LEADS${e.hasil ? ` — ${e.hasil}` : ''}`
+    : `⛔ TIDAK MASUK LEADS${e.hasil ? ` — ${e.hasil}` : ''}`;
+
+  const lines = [
+    `┌── CHAT MASUK ── ${nowWib()}`,
+    `│ Sales    : ${e.session.sales.salesName} / ${e.session.sales.branch}`,
+    `│ Pengirim : ${sender}${e.pushName ? ` (${e.pushName})` : ''}`,
+    `│ Pesan    : ${e.text ? indentBlock(e.text) : '(tanpa teks)'}`,
+    `│ Kategori : ${e.kategori}`,
+  ];
+  if (e.method) lines.push(`│ Metode   : ${e.method}`);
+  if (e.deteksi) lines.push(`│ Deteksi  : ${indentBlock(e.deteksi)}`);
+  if (e.fallbackReason) lines.push(`│ Catatan  : Gemini gagal (${e.fallbackReason}), memakai fallback kata kunci`);
+  lines.push(`│ Hasil    : ${verdict}`);
+  lines.push('└' + '─'.repeat(40));
+  console.log(lines.join('\n'));
+}
+
+// Ringkasan kategori dari hasil ekstraksi lead.
+function kategoriLead(ex) {
+  return [
+    `Nama: ${ex.nama || '-'}`,
+    `Kebutuhan: ${ex.kebutuhan || '-'}`,
+    `Budget: ${ex.budget || '-'}`,
+    `Referensi: ${ex.referensiLaptop || '-'}`,
+  ].join(' | ');
+}
+
+// Terjemahkan action dari upsertLead ke bahasa yang mudah dibaca.
+function actionLabel(action) {
+  const a = String(action || '').toLowerCase();
+  if (/creat|baru|new|insert|add/.test(a)) return 'lead BARU dibuat';
+  if (/updat|merge|perbarui|exist/.test(a)) return 'lead lama DIPERBARUI';
+  return action ? String(action) : 'tersimpan';
+}
+
 const sessions = new Map();
 const metadataPath = path.join(config.dataDir, 'sales-sessions.json');
 let restoring = false;
@@ -187,10 +272,11 @@ async function startSocket(session, folder) {
         log('MSG', `SKIP type=${type}`, label(session));
         return;
       }
-      log('MSG', `upsert type=notify jumlah=${messages.length}`, label(session));
       for (const msg of messages) {
         try { await handleIncoming(session, msg); }
-        catch (err) { logError('MSG', 'Gagal memproses chat masuk', err, label(session)); }
+        catch (err) {
+          logError('MSG', 'Gagal memproses chat masuk', err, `${label(session)} | jid=${msg?.key?.remoteJid || '-'} | "${String(getMessageText(msg)).replace(/\s+/g, ' ')}"`);
+        }
       }
     });
   } finally {
@@ -217,24 +303,7 @@ function getMessageText(msg) {
 // (fitur ini masih terus berubah di WhatsApp/Baileys), jadi dicoba
 // beberapa kemungkinan secara defensif. Kalau semua gagal, fungsi ini
 // mengembalikan null dan pesan akan di-skip dengan log yang jelas.
-async function resolvePhoneFromLid(sock, msg) {
-  const key = msg.key || {};
-  const lidJid = key.remoteJid || '';
-
-  // Cara 1: beberapa versi Baileys menaruh versi nomor-telepon-asli
-  // berdampingan dengan JID @lid, langsung di field pesan itu sendiri
-  // (nama field berbeda-beda antar versi, dicoba semua kemungkinan).
-  const altCandidates = [key.remoteJidAlt, key.senderPn, key.participantAlt, key.participantPn, msg.verifiedBizName];
-  for (const candidate of altCandidates) {
-    if (typeof candidate === 'string' && candidate.endsWith('@s.whatsapp.net')) {
-      const phone = candidate.split('@')[0].replace(/\D/g, '');
-      if (phone) return phone;
-    }
-  }
-
-  // Cara 2: lewat signalRepository.lidMapping (kalau versi Baileys-nya
-  // mendukung -- diketahui dari log DEBUG sebelumnya versi kamu TIDAK
-  // punya ini, tapi tetap dicoba untuk jaga-jaga kalau nanti di-update).
+async function resolvePhoneFromLid(sock, lidJid) {
   try {
     const mapping = sock?.signalRepository?.lidMapping;
     const resolved =
@@ -243,81 +312,122 @@ async function resolvePhoneFromLid(sock, msg) {
       null;
     if (resolved) {
       const phone = String(resolved).split('@')[0].replace(/\D/g, '');
-      if (phone) return phone;
+      return phone || null;
     }
   } catch (err) {
-    logError('MSG', 'Gagal resolve @lid lewat lidMapping', err, lidJid);
+    logError('MSG', 'Gagal resolve @lid ke nomor asli', err, lidJid);
   }
-
-  // Semua cara gagal -- dump seluruh field di key pesan (bukan seluruh
-  // pesan, supaya tidak kepanjangan) supaya kelihatan field apa saja yang
-  // sebenarnya dikirim WhatsApp untuk pesan @lid ini.
-  log('MSG', 'DEBUG @lid: semua cara resolve gagal, isi msg.key', JSON.stringify(key));
   return null;
 }
 
 async function handleIncoming(session, msg) {
-  // Diagnostik paling awal -- supaya kelihatan kalaupun pesan ke-skip di
-  // pengecekan paling pertama (fromMe, tanpa key, dll), yang mana sebelum
-  // ini TIDAK ada log-nya sama sekali kalau ke-skip di sini.
-  log(
-    'MSG',
-    'DEBUG diterima',
-    `${label(session)} | hasKey=${Boolean(msg?.key)} | fromMe=${msg?.key?.fromMe} | remoteJid=${msg?.key?.remoteJid || '-'} | msgTypeKeys=${msg?.message ? Object.keys(msg.message).join(',') : '(tanpa field message)'}`
-  );
-
-  if (!msg?.key || msg.key.fromMe) return;
-  const remoteJid = msg.key.remoteJid || '';
-  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
+  if (!msg?.key) {
+    log('MSG', 'SKIP pesan tanpa key', label(session));
     return;
   }
 
+  const remoteJid = msg.key.remoteJid || '';
+  const pushName = msg.pushName || '';
+  // Teks diambil di awal supaya SEMUA jenis log (termasuk yang di-skip)
+  // bisa menampilkan isi pesannya.
   const text = getMessageText(msg).trim();
+  const base = { session, pushName, text, sender: remoteJid };
 
-  // Resolve nomor pengirim dari JID. Untuk @lid (kontak belum tersimpan
-  // di address book), angka di JID BUKAN nomor asli -- coba resolve dulu.
+  if (msg.key.fromMe) {
+    logChat({ ...base, compact: true, kategori: 'Pesan keluar dari akun toko' });
+    return;
+  }
+  if (remoteJid.endsWith('@g.us')) {
+    logChat({ ...base, compact: true, kategori: 'Grup WhatsApp' });
+    return;
+  }
+  if (remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast') {
+    logChat({ ...base, compact: true, kategori: 'Status / Broadcast' });
+    return;
+  }
+  if (remoteJid.endsWith('@newsletter')) {
+    logChat({ ...base, compact: true, kategori: 'Channel / Newsletter' });
+    return;
+  }
+
   let phone = null;
-  let phoneIssue = null;
+
   if (remoteJid.endsWith('@s.whatsapp.net')) {
     phone = remoteJid.split('@')[0].replace(/\D/g, '');
   } else if (remoteJid.endsWith('@lid')) {
-    phone = await resolvePhoneFromLid(session.socket, msg);
-    if (!phone) phoneIssue = 'gagal resolve @lid';
+    // Coba resolve LID -> nomor asli dulu sebelum di-skip.
+    phone = await resolvePhoneFromLid(session.socket, remoteJid);
+    if (phone) {
+      log('MSG', 'Berhasil resolve @lid ke nomor asli', `${label(session)} | lid=${remoteJid} -> ${phone}`);
+    } else {
+      // Ini chat pelanggan sungguhan yang TIDAK bisa diproses -- dicatat
+      // dalam blok lengkap supaya jelas pesan apa yang terlewat.
+      logChat({
+        ...base,
+        kategori: 'Nomor tidak dikenali (format @lid)',
+        masuk: false,
+        hasil: 'Alasan: ID WhatsApp tidak bisa diubah ke nomor telepon asli',
+      });
+      return;
+    }
   } else {
-    phoneIssue = `jid tidak dikenali (${remoteJid})`;
+    logChat({ ...base, compact: true, kategori: 'Format JID tidak dikenali' });
+    return;
   }
 
-  let skip = null;
-  if (!phone) skip = phoneIssue || 'nomor tidak diketahui';
-  else if (phone === session.phone) skip = 'nomor sama dengan nomor toko sendiri';
-  else if (msg.key.id && !(await recordMessageOnce(session.sales.salesId, msg.key.id))) skip = 'duplikat, sudah pernah diproses';
-  else if (!text) skip = 'tanpa teks/caption (media)';
+  if (!phone) {
+    logChat({ ...base, compact: true, kategori: 'Nomor kosong setelah parsing' });
+    return;
+  }
+  base.sender = phone;
 
-  let extracted = null;
-  let method = null;
-  let fallbackReason = null;
-  if (!skip) {
-    ({ lead: extracted, method, fallbackReason } = await extractLead({ text, pushName: msg.pushName || '', phone }));
+  if (phone === session.phone) {
+    logChat({ ...base, compact: true, kategori: 'Nomor sama dengan nomor toko sendiri' });
+    return;
+  }
+  const messageKey = msg.key.id;
+  if (messageKey && !(await recordMessageOnce(session.sales.salesId, messageKey))) {
+    logChat({ ...base, compact: true, kategori: `Duplikat, sudah pernah diproses (id=${messageKey})` });
+    return;
   }
 
-  const methodLabel = method === 'gemini' ? 'gemini' : 'manual';
-  const diextrak = skip
-    ? `tidak diproses (${skip})`
-    : !extracted
-      ? `diabaikan, bukan lead (${methodLabel}${fallbackReason ? `, gemini gagal: ${fallbackReason}` : ''})`
-      : `${methodLabel}${fallbackReason ? ` (gemini gagal: ${fallbackReason})` : ''}`;
+  if (!text) {
+    logChat({
+      ...base,
+      kategori: 'Media tanpa teks (gambar / voice note / stiker, dll)',
+      masuk: false,
+      hasil: 'Alasan: tidak ada teks atau caption untuk dianalisis',
+    });
+    return;
+  }
 
-  // Satu baris ringkas per pesan masuk: isi pesan, nomor wa, hasil ekstraksi.
-  log('CHAT', `pesan masuk="${text || '-'}"`, `no wa=${phone || '-'} | ${label(session)} | diextrak=${diextrak}`);
+  const { lead: extracted, method, fallbackReason, skipReason, detail } = await extractLead({ text, pushName, phone });
+  const methodLabel = method === 'gemini'
+    ? 'AI Gemini'
+    : (fallbackReason ? 'Aturan kata kunci (fallback)' : 'Aturan kata kunci (manual)');
 
-  if (skip || !extracted) return;
+  if (!extracted) {
+    logChat({
+      ...base,
+      kategori: 'Bukan lead',
+      method: methodLabel,
+      fallbackReason,
+      masuk: false,
+      hasil: `Alasan: ${skipReason || 'chat tidak dikenali sebagai calon pembeli'}`,
+    });
+    return;
+  }
 
   const result = await upsertLead({ sales: session.sales, extracted });
-  log(
-    'LEAD',
-    `${result.action} id=${result.id}`,
-    `${phone} | ${session.sales.branch} | nama=${extracted.nama || '-'} kebutuhan=${extracted.kebutuhan || '-'} budget=${extracted.budget || '-'} referensi=${extracted.referensiLaptop || '-'}`
-  );
+  logChat({
+    ...base,
+    kategori: kategoriLead(extracted),
+    method: methodLabel,
+    deteksi: detail,
+    fallbackReason,
+    masuk: true,
+    hasil: `${actionLabel(result.action)} (id=${result.id})`,
+  });
 }
 
 export async function disconnectSales(salesId, logout = false) {
@@ -349,11 +459,6 @@ export async function restoreSessions() {
       const s = {
         sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch },
         connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
-        // JANGAN di-hardcode true di sini -- startSocket() di bawah akan
-        // menentukan nilai sebenarnya dari creds.registered begitu folder
-        // sesinya dibaca. Sesi yang BELUM pernah discan (creds.registered
-        // masih false) harus tetap tunduk ke jam idle, bukan dianggap
-        // "sudah terhubung" cuma karena pernah tersimpan di metadata.
         hasEverConnected: false,
         lastRequestedAt: Date.now(),
       };
