@@ -17,22 +17,32 @@ import {
 } from './firestore-leads.js';
 
 // ============================================================
-// KONFIGURASI
+// CONFIGURATION
 // ============================================================
 
-const baileysLogger = pino({ level: 'silent' });
+// Logger khusus Baileys.
+// Menekan log internal library, termasuk spam Bad MAC.
+// Log aplikasi tetap menggunakan console di bawah.
+const baileysLogger = pino({
+  level: 'silent',
+});
+
+// Pengaturan reconnect dan QR.
+const RECONNECT_DELAY_MS = Math.max(
+  3000,
+  Number(process.env.WA_RECONNECT_DELAY_MS || 5000)
+);
 
 const QR_IDLE_TIMEOUT_MS = Math.max(
   15000,
   Number(process.env.QR_IDLE_TIMEOUT_MS || 90000)
 );
 
-const RECONNECT_DELAY_MS = Math.max(
-  1000,
-  Number(process.env.WA_RECONNECT_DELAY_MS || 3000)
-);
-
 const MAX_CHAT_LOG_LENGTH = 2000;
+
+// ============================================================
+// GLOBAL STATE
+// ============================================================
 
 const sessions = new Map();
 
@@ -42,20 +52,14 @@ const metadataPath = path.join(
 );
 
 let restoring = false;
-let metadataWriteQueue = Promise.resolve();
+let metadataQueue = Promise.resolve();
 
 fs.mkdirSync(config.sessionsDir, { recursive: true });
 fs.mkdirSync(config.dataDir, { recursive: true });
 
 // ============================================================
-// LOGGER
+// APPLICATION LOGGER
 // ============================================================
-
-function safeError(err) {
-  return String(err?.message || err || 'Unknown error')
-    .replace(/\s+/g, ' ')
-    .slice(0, 300);
-}
 
 function logInfo(tag, message, detail = '') {
   console.log(
@@ -69,6 +73,12 @@ function logWarn(tag, message, detail = '') {
   );
 }
 
+function safeError(err) {
+  return String(err?.message || err || 'Unknown error')
+    .replace(/\s+/g, ' ')
+    .slice(0, 300);
+}
+
 function logError(tag, message, err, detail = '') {
   console.error(
     `[${tag}] ${message}: ${safeError(err)}` +
@@ -78,6 +88,19 @@ function logError(tag, message, err, detail = '') {
 
 function label(session) {
   return `${session.sales.salesName}/${session.sales.branch}`;
+}
+
+// ============================================================
+// CHAT LOGGER
+// ============================================================
+
+function cleanChatText(value) {
+  return String(value || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, MAX_CHAT_LOG_LENGTH);
 }
 
 function actionLabel(action) {
@@ -94,19 +117,6 @@ function actionLabel(action) {
   return action || 'tersimpan';
 }
 
-// ============================================================
-// LOG CHAT MASUK
-// ============================================================
-
-function cleanChatText(text) {
-  return String(text || '')
-    .replace(/\r?\n/g, ' ')
-    .replace(/\s+/g, ' ')
-    .replace(/[\u0000-\u001F\u007F]/g, '')
-    .trim()
-    .slice(0, MAX_CHAT_LOG_LENGTH);
-}
-
 function logChat({
   session,
   phone,
@@ -115,10 +125,10 @@ function logChat({
   masuk = false,
   hasil = '',
 }) {
-  const pesan = cleanChatText(text) || '(tanpa teks)';
+  const message = cleanChatText(text) || '(tanpa teks)';
 
   const head =
-    `[CHAT] ${label(session)} | ${phone || '-'} | "${pesan}"`;
+    `[CHAT] ${label(session)} | ${phone} | "${message}"`;
 
   if (masuk && extracted) {
     const detail = [
@@ -145,7 +155,7 @@ function logChat({
 }
 
 // ============================================================
-// UTILITAS SESI
+// SESSION UTILITIES
 // ============================================================
 
 function safeFolder(salesId) {
@@ -156,19 +166,6 @@ function safeFolder(salesId) {
   }
 
   return path.join(config.sessionsDir, id);
-}
-
-function statusOf(session) {
-  return {
-    salesId: session.sales.salesId,
-    salesName: session.sales.salesName,
-    branch: session.sales.branch,
-    connected: Boolean(session.connected),
-    hasQr: Boolean(session.qr),
-    phone: session.phone || null,
-    enabled: session.enabled !== false,
-    starting: Boolean(session.starting),
-  };
 }
 
 function createSession(sales) {
@@ -190,28 +187,19 @@ function createSession(sales) {
 
     hasEverConnected: false,
     lastRequestedAt: Date.now(),
-
-    lidMap: new Map(),
   };
 }
 
-function clearReconnectTimer(session) {
-  if (session.reconnectTimer) {
-    clearTimeout(session.reconnectTimer);
-    session.reconnectTimer = null;
-  }
-}
-
-function clearQrIdleTimer(session) {
-  if (session.qrIdleTimer) {
-    clearTimeout(session.qrIdleTimer);
-    session.qrIdleTimer = null;
-  }
-}
-
-function clearSessionTimers(session) {
-  clearReconnectTimer(session);
-  clearQrIdleTimer(session);
+function statusOf(session) {
+  return {
+    salesId: session.sales.salesId,
+    salesName: session.sales.salesName,
+    branch: session.sales.branch,
+    connected: Boolean(session.connected),
+    hasQr: Boolean(session.qr),
+    phone: session.phone || null,
+    enabled: session.enabled !== false,
+  };
 }
 
 function isCurrentSocket(session, socket, generation) {
@@ -221,11 +209,30 @@ function isCurrentSocket(session, socket, generation) {
   );
 }
 
+function clearReconnectTimer(session) {
+  if (session.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = null;
+  }
+}
+
+function clearQrTimer(session) {
+  if (session.qrIdleTimer) {
+    clearTimeout(session.qrIdleTimer);
+    session.qrIdleTimer = null;
+  }
+}
+
+function clearTimers(session) {
+  clearReconnectTimer(session);
+  clearQrTimer(session);
+}
+
 // ============================================================
-// METADATA
+// SAFE METADATA STORAGE
 // ============================================================
 
-function writeMetadataAtomic() {
+function writeMetadata() {
   const data = [...sessions.values()].map(session => ({
     salesId: session.sales.salesId,
     salesName: session.sales.salesName,
@@ -248,17 +255,17 @@ function writeMetadataAtomic() {
 }
 
 function saveMetadata() {
-  metadataWriteQueue = metadataWriteQueue
-    .then(() => writeMetadataAtomic())
+  metadataQueue = metadataQueue
+    .then(() => writeMetadata())
     .catch(err => {
-      logError('META', 'Gagal menyimpan metadata', err);
+      logError('META', 'Gagal menyimpan metadata sesi', err);
     });
 
-  return metadataWriteQueue;
+  return metadataQueue;
 }
 
 // ============================================================
-// PUBLIC SESSION API
+// PUBLIC SESSION FUNCTIONS
 // ============================================================
 
 export function listSessions() {
@@ -279,14 +286,6 @@ export function getQr(salesId) {
   }
 
   return session.qr || null;
-}
-
-export function touchSession(salesId) {
-  const session = sessions.get(String(salesId));
-
-  if (session && session.enabled) {
-    session.lastRequestedAt = Date.now();
-  }
 }
 
 // ============================================================
@@ -335,13 +334,14 @@ export async function connectSales({
   session.lastRequestedAt = Date.now();
 
   await saveMetadata();
+
   await startSocket(session, folder);
 
   return statusOf(session);
 }
 
 // ============================================================
-// START SOCKET
+// START WHATSAPP SOCKET
 // ============================================================
 
 async function startSocket(session, folder) {
@@ -355,7 +355,7 @@ async function startSocket(session, folder) {
   }
 
   clearReconnectTimer(session);
-  clearQrIdleTimer(session);
+  clearQrTimer(session);
 
   session.starting = true;
 
@@ -379,7 +379,11 @@ async function startSocket(session, folder) {
 
     sock = makeWASocket({
       auth: state,
+
+      // Penting: logger Baileys silent untuk mencegah
+      // error internal Bad MAC membanjiri log hosting.
       logger: baileysLogger,
+
       printQRInTerminal: false,
 
       browser: [
@@ -407,8 +411,6 @@ async function startSocket(session, folder) {
         );
       }
     });
-
-    registerLidListeners(session, sock);
 
     registerConnectionListener(
       session,
@@ -438,7 +440,7 @@ async function startSocket(session, folder) {
 
     logError(
       'WA',
-      'Gagal memulai socket',
+      'Gagal memulai socket WhatsApp',
       err,
       label(session)
     );
@@ -451,7 +453,7 @@ async function startSocket(session, folder) {
 }
 
 // ============================================================
-// CONNECTION LISTENER
+// CONNECTION UPDATE
 // ============================================================
 
 function registerConnectionListener(
@@ -473,9 +475,10 @@ function registerConnectionListener(
         lastDisconnect,
       } = update;
 
+      // QR CREATED
       if (qr) {
         try {
-          const dataUrl = await QRCode.toDataURL(qr);
+          const qrData = await QRCode.toDataURL(qr);
 
           if (
             !isCurrentSocket(session, sock, generation) ||
@@ -484,15 +487,15 @@ function registerConnectionListener(
             return;
           }
 
-          session.qr = dataUrl;
+          session.qr = qrData;
 
           logInfo(
             'WA',
-            'QR WhatsApp berhasil dibuat',
+            'QR berhasil dibuat',
             label(session)
           );
 
-          scheduleQrIdleCheck(session, folder);
+          scheduleQrIdle(session, folder);
 
         } catch (err) {
           logError(
@@ -504,8 +507,9 @@ function registerConnectionListener(
         }
       }
 
+      // CONNECTED
       if (connection === 'open') {
-        clearQrIdleTimer(session);
+        clearQrTimer(session);
         clearReconnectTimer(session);
 
         session.connected = true;
@@ -527,6 +531,7 @@ function registerConnectionListener(
         return;
       }
 
+      // DISCONNECTED
       if (connection === 'close') {
         session.connected = false;
         session.qr = null;
@@ -550,7 +555,7 @@ function registerConnectionListener(
           session.enabled = false;
           session.phone = null;
 
-          clearSessionTimers(session);
+          clearTimers(session);
 
           logWarn(
             'WA',
@@ -579,7 +584,7 @@ function registerConnectionListener(
         } else {
           logInfo(
             'WA',
-            'QR dihentikan karena idle',
+            'QR dihentikan karena tidak aktif',
             label(session)
           );
         }
@@ -589,7 +594,7 @@ function registerConnectionListener(
 }
 
 // ============================================================
-// RECONNECT
+// RECONNECT WITH SINGLE TIMER
 // ============================================================
 
 function scheduleReconnect(session, folder) {
@@ -637,15 +642,16 @@ function scheduleReconnect(session, folder) {
 }
 
 // ============================================================
-// QR IDLE
+// QR IDLE TIMEOUT
 // ============================================================
 
-function scheduleQrIdleCheck(session, folder) {
-  clearQrIdleTimer(session);
+function scheduleQrIdle(session, folder) {
+  clearQrTimer(session);
 
   if (
-    session.hasEverConnected ||
-    !session.enabled
+    !session.enabled ||
+    session.connected ||
+    session.hasEverConnected
   ) {
     return;
   }
@@ -655,7 +661,7 @@ function scheduleQrIdleCheck(session, folder) {
     (Date.now() - (session.lastRequestedAt || 0));
 
   if (remaining <= 0) {
-    stopIdleQrSession(session);
+    stopIdleQr(session);
     return;
   }
 
@@ -663,9 +669,9 @@ function scheduleQrIdleCheck(session, folder) {
     session.qrIdleTimer = null;
 
     if (
+      !session.enabled ||
       session.connected ||
-      session.hasEverConnected ||
-      !session.enabled
+      session.hasEverConnected
     ) {
       return;
     }
@@ -674,9 +680,9 @@ function scheduleQrIdleCheck(session, folder) {
       Date.now() - (session.lastRequestedAt || 0);
 
     if (idleFor >= QR_IDLE_TIMEOUT_MS) {
-      stopIdleQrSession(session);
+      stopIdleQr(session);
     } else {
-      scheduleQrIdleCheck(session, folder);
+      scheduleQrIdle(session, folder);
     }
 
   }, remaining);
@@ -684,30 +690,24 @@ function scheduleQrIdleCheck(session, folder) {
   session.qrIdleTimer.unref?.();
 }
 
-function stopIdleQrSession(session) {
+function stopIdleQr(session) {
   if (
-    session.hasEverConnected ||
+    !session.enabled ||
     session.connected ||
-    !session.enabled
+    session.hasEverConnected
   ) {
     return;
   }
 
-  logInfo(
-    'WA',
-    'Menghentikan sesi QR idle',
-    label(session)
-  );
-
-  clearSessionTimers(session);
-
-  session.qr = null;
+  clearTimers(session);
 
   const sock = session.socket;
 
   session.socket = null;
   session.connected = false;
+  session.qr = null;
 
+  // Invalidasi event dari socket lama.
   session.socketGeneration++;
 
   try {
@@ -715,11 +715,36 @@ function stopIdleQrSession(session) {
   } catch (err) {
     logError(
       'WA',
-      'Gagal menghentikan socket idle',
+      'Gagal menghentikan QR idle',
       err,
       label(session)
     );
   }
+
+  logInfo(
+    'WA',
+    'Sesi QR dihentikan karena idle',
+    label(session)
+  );
+}
+
+// ============================================================
+// MESSAGE TEXT EXTRACTOR
+// ============================================================
+
+function getMessageText(msg) {
+  const m = msg?.message || {};
+
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    ''
+  );
 }
 
 // ============================================================
@@ -755,197 +780,10 @@ function registerMessageListener(
             err,
             label(session)
           );
-
-          // Isi pesan sengaja tidak ditambahkan ke log error.
-          // Isi chat ditampilkan melalui logChat() jika berhasil
-          // mencapai tahap pemrosesan pesan.
         }
       }
     }
   );
-}
-
-// ============================================================
-// EXTRACT MESSAGE TEXT
-// ============================================================
-
-function getMessageText(msg) {
-  const message = msg?.message || {};
-
-  return (
-    message.conversation ||
-    message.extendedTextMessage?.text ||
-    message.imageMessage?.caption ||
-    message.videoMessage?.caption ||
-    message.documentMessage?.caption ||
-    message.buttonsResponseMessage?.selectedDisplayText ||
-    message.listResponseMessage?.title ||
-    ''
-  );
-}
-
-// ============================================================
-// RESOLVE JID / PHONE
-// ============================================================
-
-function jidUser(jid) {
-  return String(jid || '')
-    .split('@')[0]
-    .split(':')[0];
-}
-
-function phoneFromJid(jid) {
-  const value = String(jid || '');
-
-  if (!value) return null;
-
-  if (
-    value.includes('@') &&
-    !value.endsWith('@s.whatsapp.net')
-  ) {
-    return null;
-  }
-
-  const digits = jidUser(value).replace(/\D/g, '');
-
-  return digits.length >= 8 ? digits : null;
-}
-
-function rememberLid(session, lidJid, pnJid) {
-  try {
-    const phone = phoneFromJid(pnJid);
-    const lidKey = jidUser(lidJid);
-
-    if (!session.lidMap) {
-      session.lidMap = new Map();
-    }
-
-    if (
-      phone &&
-      lidKey &&
-      String(lidJid).includes('@lid')
-    ) {
-      session.lidMap.set(lidKey, phone);
-    }
-  } catch {
-    // Mapping hanya bersifat best-effort.
-  }
-}
-
-function registerLidListeners(session, sock) {
-  if (!session.lidMap) {
-    session.lidMap = new Map();
-  }
-
-  try {
-    sock.ev.on('lid-mapping.update', update => {
-      for (const item of [].concat(update || [])) {
-        rememberLid(
-          session,
-          item?.lid,
-          item?.pn
-        );
-      }
-    });
-
-    const onContacts = contacts => {
-      for (const contact of contacts || []) {
-        if (String(contact?.id || '').endsWith('@lid')) {
-          rememberLid(
-            session,
-            contact.id,
-            contact.phoneNumber
-          );
-        } else if (contact?.lid) {
-          rememberLid(
-            session,
-            contact.lid,
-            contact.id
-          );
-        }
-      }
-    };
-
-    sock.ev.on('contacts.upsert', onContacts);
-    sock.ev.on('contacts.update', onContacts);
-
-  } catch (err) {
-    logError(
-      'WA',
-      'Gagal memasang listener LID',
-      err,
-      label(session)
-    );
-  }
-}
-
-async function resolvePhoneFromLid(
-  session,
-  msg,
-  lidJid
-) {
-  const key = msg?.key || {};
-
-  const candidates = [
-    key.remoteJidAlt,
-    key.senderPn,
-    key.participantPn,
-    key.participantAlt,
-    msg?.senderPn,
-  ];
-
-  for (const candidate of candidates) {
-    const phone = phoneFromJid(candidate);
-
-    if (phone) {
-      rememberLid(session, lidJid, candidate);
-      return phone;
-    }
-  }
-
-  const cached = session.lidMap?.get(
-    jidUser(lidJid)
-  );
-
-  if (cached) return cached;
-
-  try {
-    const mapping =
-      session.socket?.signalRepository?.lidMapping;
-
-    const resolved =
-      (await mapping?.getPNForLID?.(lidJid)) ||
-      (await mapping?.getPNForLid?.(lidJid)) ||
-      null;
-
-    const phone =
-      phoneFromJid(resolved) ||
-      (
-        resolved
-          ? String(resolved).replace(/\D/g, '')
-          : null
-      );
-
-    if (phone && phone.length >= 8) {
-      rememberLid(
-        session,
-        lidJid,
-        `${phone}@s.whatsapp.net`
-      );
-
-      return phone;
-    }
-
-  } catch (err) {
-    logError(
-      'MSG',
-      'Gagal resolve LID',
-      err,
-      label(session)
-    );
-  }
-
-  return null;
 }
 
 // ============================================================
@@ -967,54 +805,23 @@ async function handleIncoming(session, msg) {
     return;
   }
 
-  const pushName = msg.pushName || '';
-  const text = String(getMessageText(msg)).trim();
-
-  let phone = null;
-
-  if (remoteJid.endsWith('@s.whatsapp.net')) {
-    phone = remoteJid
-      .split('@')[0]
-      .replace(/\D/g, '');
-
-    if (
-      String(msg.key.remoteJidAlt || '').endsWith('@lid')
-    ) {
-      rememberLid(
-        session,
-        msg.key.remoteJidAlt,
-        remoteJid
-      );
-    }
-
-  } else if (remoteJid.endsWith('@lid')) {
-    phone = await resolvePhoneFromLid(
-      session,
-      msg,
-      remoteJid
-    );
-
-    if (!phone) {
-      logChat({
-        session,
-        phone: remoteJid,
-        text,
-        masuk: false,
-        hasil: 'Nomor asli tidak tersedia dari WhatsApp (@lid)',
-      });
-
-      return;
-    }
-
-  } else {
+  // Versi file saat ini hanya memproses chat pribadi
+  // yang JID-nya berupa nomor WhatsApp.
+  if (!remoteJid.endsWith('@s.whatsapp.net')) {
     return;
   }
+
+  const phone = remoteJid
+    .split('@')[0]
+    .replace(/\D/g, '');
 
   if (!phone || phone === session.phone) {
     return;
   }
 
-  // Deduplikasi pesan.
+  const text = String(getMessageText(msg)).trim();
+
+  // Deduplikasi pesan agar tidak tercatat dua kali.
   const messageKey = msg.key.id;
 
   if (!messageKey) {
@@ -1034,22 +841,17 @@ async function handleIncoming(session, msg) {
 
   if (!isNewMessage) return;
 
-  // Media tanpa caption tidak dapat diekstrak sebagai teks.
-  if (!text) return;
+  // Media tanpa caption.
+  if (!text) {
+    return;
+  }
 
-  const extractedResult = await extractLead({
+  // Ekstraksi calon lead.
+  const extracted = extractLead({
     text,
-    pushName,
+    pushName: msg.pushName || '',
     phone,
   });
-
-  const extracted =
-    extractedResult?.lead ?? extractedResult;
-
-  const skipReason =
-    extractedResult?.lead
-      ? extractedResult.skipReason
-      : null;
 
   if (!extracted) {
     logChat({
@@ -1057,14 +859,13 @@ async function handleIncoming(session, msg) {
       phone,
       text,
       masuk: false,
-      hasil:
-        skipReason ||
-        'Chat tidak dikenali sebagai calon pembeli',
+      hasil: 'Chat tidak dikenali sebagai calon pembeli',
     });
 
     return;
   }
 
+  // Simpan atau perbarui lead.
   const result = await upsertLead({
     sales: session.sales,
     extracted,
@@ -1095,7 +896,7 @@ export async function disconnectSales(
     throw new Error('Sesi sales tidak ditemukan');
   }
 
-  clearSessionTimers(session);
+  clearTimers(session);
 
   session.enabled = false;
   session.connected = false;
@@ -1103,6 +904,7 @@ export async function disconnectSales(
 
   const sock = session.socket;
 
+  // Cegah event dari socket lama memengaruhi sesi.
   session.socketGeneration++;
   session.socket = null;
 
@@ -1171,7 +973,14 @@ export async function disconnectSales(
 // ============================================================
 
 export async function restoreSessions() {
-  if (restoring) return;
+  if (restoring) {
+    logWarn(
+      'RESTORE',
+      'Proses restore sedang berjalan'
+    );
+
+    return;
+  }
 
   restoring = true;
 
@@ -1204,7 +1013,7 @@ export async function restoreSessions() {
     if (!Array.isArray(entries)) {
       logWarn(
         'RESTORE',
-        'Format metadata tidak valid'
+        'Format metadata bukan array'
       );
 
       return;
@@ -1217,7 +1026,9 @@ export async function restoreSessions() {
 
     for (const item of entries) {
       try {
-        if (!item || item.enabled === false) continue;
+        if (!item || item.enabled === false) {
+          continue;
+        }
 
         const salesId = String(item.salesId || '');
 
@@ -1243,7 +1054,10 @@ export async function restoreSessions() {
 
         const existing = sessions.get(salesId);
 
-        if (existing?.socket || existing?.starting) {
+        if (
+          existing?.socket ||
+          existing?.starting
+        ) {
           continue;
         }
 
@@ -1269,7 +1083,7 @@ export async function restoreSessions() {
       } catch (err) {
         logError(
           'RESTORE',
-          'Gagal memulihkan sesi, lanjut sesi berikutnya',
+          'Gagal memulihkan satu sesi',
           err,
           String(item?.salesId || 'unknown')
         );
@@ -1278,7 +1092,7 @@ export async function restoreSessions() {
 
     logInfo(
       'RESTORE',
-      'Pemulihan seluruh sesi selesai'
+      'Proses pemulihan selesai'
     );
 
   } catch (err) {
