@@ -32,7 +32,7 @@ const RECONNECT_DELAY_MS = Math.max(
   Number(process.env.WA_RECONNECT_DELAY_MS || 3000)
 );
 
-const MAX_LOG_TEXT_LENGTH = 300;
+const MAX_CHAT_LOG_LENGTH = 2000;
 
 const sessions = new Map();
 
@@ -52,30 +52,27 @@ fs.mkdirSync(config.dataDir, { recursive: true });
 // ============================================================
 
 function safeError(err) {
-  const message = err?.message || String(err || 'Unknown error');
-
-  return String(message)
-    .replace(/\b\d{8,16}\b/g, '[REDACTED]')
+  return String(err?.message || err || 'Unknown error')
     .replace(/\s+/g, ' ')
-    .slice(0, MAX_LOG_TEXT_LENGTH);
+    .slice(0, 300);
 }
 
 function logInfo(tag, message, detail = '') {
-  const suffix = detail ? ` | ${detail}` : '';
-  console.log(`[${tag}] ${message}${suffix}`);
+  console.log(
+    `[${tag}] ${message}${detail ? ` | ${detail}` : ''}`
+  );
 }
 
 function logWarn(tag, message, detail = '') {
-  const suffix = detail ? ` | ${detail}` : '';
-  console.warn(`[${tag}] ${message}${suffix}`);
+  console.warn(
+    `[${tag}] ${message}${detail ? ` | ${detail}` : ''}`
+  );
 }
 
 function logError(tag, message, err, detail = '') {
-  const errorText = safeError(err);
-  const suffix = detail ? ` | ${detail}` : '';
-
   console.error(
-    `[${tag}] ${message}: ${errorText}${suffix}`
+    `[${tag}] ${message}: ${safeError(err)}` +
+    `${detail ? ` | ${detail}` : ''}`
   );
 }
 
@@ -94,17 +91,35 @@ function actionLabel(action) {
     return 'lead lama DIPERBARUI';
   }
 
-  return action ? String(action) : 'tersimpan';
+  return action || 'tersimpan';
 }
 
-// Log tidak menyimpan isi chat atau nomor pelanggan.
-// Ini mengurangi risiko data pribadi masuk ke terminal/log.
+// ============================================================
+// LOG CHAT MASUK
+// ============================================================
+
+function cleanChatText(text) {
+  return String(text || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .trim()
+    .slice(0, MAX_CHAT_LOG_LENGTH);
+}
+
 function logChat({
   session,
-  extracted,
-  masuk,
-  hasil,
+  phone,
+  text,
+  extracted = null,
+  masuk = false,
+  hasil = '',
 }) {
+  const pesan = cleanChatText(text) || '(tanpa teks)';
+
+  const head =
+    `[CHAT] ${label(session)} | ${phone || '-'} | "${pesan}"`;
+
   if (masuk && extracted) {
     const detail = [
       `nama=${extracted.nama || '-'}`,
@@ -115,7 +130,7 @@ function logChat({
 
     logInfo(
       'CHAT',
-      `${label(session)} | MASUK LEADS (${hasil})`,
+      `${head} | MASUK LEADS (${hasil})`,
       detail
     );
 
@@ -124,8 +139,8 @@ function logChat({
 
   logInfo(
     'CHAT',
-    `${label(session)} | TIDAK MASUK LEADS`,
-    hasil || 'Tidak memenuhi kriteria lead'
+    `${head} | TIDAK MASUK LEADS`,
+    `alasan=${hasil || 'Tidak memenuhi kriteria lead'}`
   );
 }
 
@@ -137,9 +152,7 @@ function safeFolder(salesId) {
   const id = String(salesId || '');
 
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) {
-    throw new Error(
-      'salesId hanya boleh huruf, angka, underscore, atau tanda minus'
-    );
+    throw new Error('salesId tidak valid');
   }
 
   return path.join(config.sessionsDir, id);
@@ -212,8 +225,6 @@ function isCurrentSocket(session, socket, generation) {
 // METADATA
 // ============================================================
 
-// Menulis ke file sementara terlebih dahulu.
-// Setelah selesai, file sementara menggantikan file metadata lama.
 function writeMetadataAtomic() {
   const data = [...sessions.values()].map(session => ({
     salesId: session.sales.salesId,
@@ -238,11 +249,9 @@ function writeMetadataAtomic() {
 
 function saveMetadata() {
   metadataWriteQueue = metadataWriteQueue
-    .then(() => {
-      writeMetadataAtomic();
-    })
+    .then(() => writeMetadataAtomic())
     .catch(err => {
-      logError('META', 'Gagal menyimpan metadata sesi', err);
+      logError('META', 'Gagal menyimpan metadata', err);
     });
 
   return metadataWriteQueue;
@@ -269,38 +278,14 @@ export function getQr(salesId) {
     return null;
   }
 
-  // Polling QR tidak memperpanjang waktu idle.
   return session.qr || null;
 }
 
 export function touchSession(salesId) {
   const session = sessions.get(String(salesId));
 
-  if (!session || !session.enabled) {
-    return;
-  }
-
-  session.lastRequestedAt = Date.now();
-
-  // Jika sesi belum pernah berhasil pairing dan socket berhenti,
-  // aksi eksplisit dari pengguna boleh memulai kembali koneksi.
-  if (
-    !session.connected &&
-    !session.starting &&
-    !session.socket &&
-    !session.hasEverConnected
-  ) {
-    startSocket(
-      session,
-      safeFolder(session.sales.salesId)
-    ).catch(err => {
-      logError(
-        'WA',
-        'Gagal memulai sesi setelah permintaan QR',
-        err,
-        label(session)
-      );
-    });
+  if (session && session.enabled) {
+    session.lastRequestedAt = Date.now();
   }
 }
 
@@ -314,7 +299,6 @@ export async function connectSales({
   branch,
 }) {
   const id = String(salesId || '');
-
   const folder = safeFolder(id);
 
   if (!salesName?.trim() || !branch?.trim()) {
@@ -334,13 +318,12 @@ export async function connectSales({
     session.enabled = true;
     session.lastRequestedAt = Date.now();
 
-    await saveMetadata();
-
     if (
       session.connected ||
       session.starting ||
       session.socket
     ) {
+      await saveMetadata();
       return statusOf(session);
     }
   } else {
@@ -352,7 +335,6 @@ export async function connectSales({
   session.lastRequestedAt = Date.now();
 
   await saveMetadata();
-
   await startSocket(session, folder);
 
   return statusOf(session);
@@ -363,16 +345,12 @@ export async function connectSales({
 // ============================================================
 
 async function startSocket(session, folder) {
-  if (!session.enabled) {
-    return;
-  }
-
-  if (session.starting || session.connected) {
-    return;
-  }
-
-  // Jangan membuat socket kedua ketika socket lama masih aktif.
-  if (session.socket) {
+  if (
+    !session.enabled ||
+    session.starting ||
+    session.connected ||
+    session.socket
+  ) {
     return;
   }
 
@@ -393,9 +371,7 @@ async function startSocket(session, folder) {
       saveCreds,
     } = await useMultiFileAuthState(folder);
 
-    if (!session.enabled) {
-      return;
-    }
+    if (!session.enabled) return;
 
     if (state.creds?.registered) {
       session.hasEverConnected = true;
@@ -404,7 +380,6 @@ async function startSocket(session, folder) {
     sock = makeWASocket({
       auth: state,
       logger: baileysLogger,
-
       printQRInTerminal: false,
 
       browser: [
@@ -426,7 +401,7 @@ async function startSocket(session, folder) {
       } catch (err) {
         logError(
           'WA',
-          'Gagal menyimpan kredensial WhatsApp',
+          'Gagal menyimpan kredensial',
           err,
           label(session)
         );
@@ -455,7 +430,7 @@ async function startSocket(session, folder) {
     );
 
   } catch (err) {
-    if (session.socket === sock || !sock) {
+    if (!sock || session.socket === sock) {
       session.socket = null;
       session.connected = false;
       session.qr = null;
@@ -463,7 +438,7 @@ async function startSocket(session, folder) {
 
     logError(
       'WA',
-      'Gagal memulai socket WhatsApp',
+      'Gagal memulai socket',
       err,
       label(session)
     );
@@ -522,7 +497,7 @@ function registerConnectionListener(
         } catch (err) {
           logError(
             'WA',
-            'Gagal membuat QR WhatsApp',
+            'Gagal membuat QR',
             err,
             label(session)
           );
@@ -545,11 +520,10 @@ function registerConnectionListener(
         logInfo(
           'WA',
           'WhatsApp berhasil terhubung',
-          `${label(session)} | status=connected`
+          label(session)
         );
 
         await saveMetadata();
-
         return;
       }
 
@@ -580,29 +554,23 @@ function registerConnectionListener(
 
           logWarn(
             'WA',
-            'WhatsApp logout. Pairing ulang diperlukan',
+            'WhatsApp logout, pairing ulang diperlukan',
             label(session)
           );
 
           await saveMetadata();
-
           return;
         }
 
-        // Socket sudah close. Lepaskan referensinya agar
-        // reconnect berikutnya dapat membuat socket baru.
         if (session.socket === sock) {
           session.socket = null;
         }
 
-        // Sesi yang sudah pernah pairing boleh reconnect otomatis.
         if (session.hasEverConnected) {
           scheduleReconnect(session, folder);
           return;
         }
 
-        // Sesi yang belum pernah pairing hanya membuat QR
-        // jika masih ada permintaan aktif dari pengguna.
         const idleFor =
           Date.now() - (session.lastRequestedAt || 0);
 
@@ -611,7 +579,7 @@ function registerConnectionListener(
         } else {
           logInfo(
             'WA',
-            'QR dihentikan karena tidak ada aktivitas',
+            'QR dihentikan karena idle',
             label(session)
           );
         }
@@ -621,25 +589,23 @@ function registerConnectionListener(
 }
 
 // ============================================================
-// RECONNECT MANAGEMENT
+// RECONNECT
 // ============================================================
 
 function scheduleReconnect(session, folder) {
-  if (!session.enabled) {
-    return;
-  }
-
-  if (session.connected || session.starting) {
-    return;
-  }
-
-  if (session.reconnectTimer) {
+  if (
+    !session.enabled ||
+    session.connected ||
+    session.starting ||
+    session.reconnectTimer
+  ) {
     return;
   }
 
   if (
     !session.hasEverConnected &&
-    Date.now() - (session.lastRequestedAt || 0) >= QR_IDLE_TIMEOUT_MS
+    Date.now() - (session.lastRequestedAt || 0) >=
+      QR_IDLE_TIMEOUT_MS
   ) {
     return;
   }
@@ -647,11 +613,12 @@ function scheduleReconnect(session, folder) {
   session.reconnectTimer = setTimeout(() => {
     session.reconnectTimer = null;
 
-    if (!session.enabled || session.connected) {
-      return;
-    }
-
-    if (session.socket || session.starting) {
+    if (
+      !session.enabled ||
+      session.connected ||
+      session.socket ||
+      session.starting
+    ) {
       return;
     }
 
@@ -670,7 +637,7 @@ function scheduleReconnect(session, folder) {
 }
 
 // ============================================================
-// QR IDLE MANAGEMENT
+// QR IDLE
 // ============================================================
 
 function scheduleQrIdleCheck(session, folder) {
@@ -708,10 +675,9 @@ function scheduleQrIdleCheck(session, folder) {
 
     if (idleFor >= QR_IDLE_TIMEOUT_MS) {
       stopIdleQrSession(session);
-      return;
+    } else {
+      scheduleQrIdleCheck(session, folder);
     }
-
-    scheduleQrIdleCheck(session, folder);
 
   }, remaining);
 
@@ -729,7 +695,7 @@ function stopIdleQrSession(session) {
 
   logInfo(
     'WA',
-    'Menghentikan sesi QR yang idle',
+    'Menghentikan sesi QR idle',
     label(session)
   );
 
@@ -742,7 +708,6 @@ function stopIdleQrSession(session) {
   session.socket = null;
   session.connected = false;
 
-  // Naikkan generation agar event dari socket lama diabaikan.
   session.socketGeneration++;
 
   try {
@@ -750,7 +715,7 @@ function stopIdleQrSession(session) {
   } catch (err) {
     logError(
       'WA',
-      'Gagal menghentikan socket QR idle',
+      'Gagal menghentikan socket idle',
       err,
       label(session)
     );
@@ -769,9 +734,7 @@ function registerMessageListener(
   sock.ev.on(
     'messages.upsert',
     async ({ messages, type }) => {
-      if (type !== 'notify') {
-        return;
-      }
+      if (type !== 'notify') return;
 
       if (!isCurrentSocket(session, sock, generation)) {
         return;
@@ -788,10 +751,14 @@ function registerMessageListener(
         } catch (err) {
           logError(
             'MSG',
-            'Gagal memproses pesan masuk',
+            'Gagal memproses chat masuk',
             err,
             label(session)
           );
+
+          // Isi pesan sengaja tidak ditambahkan ke log error.
+          // Isi chat ditampilkan melalui logChat() jika berhasil
+          // mencapai tahap pemrosesan pesan.
         }
       }
     }
@@ -799,7 +766,7 @@ function registerMessageListener(
 }
 
 // ============================================================
-// MESSAGE TEXT
+// EXTRACT MESSAGE TEXT
 // ============================================================
 
 function getMessageText(msg) {
@@ -818,7 +785,7 @@ function getMessageText(msg) {
 }
 
 // ============================================================
-// JID AND PHONE RESOLUTION
+// RESOLVE JID / PHONE
 // ============================================================
 
 function jidUser(jid) {
@@ -830,9 +797,7 @@ function jidUser(jid) {
 function phoneFromJid(jid) {
   const value = String(jid || '');
 
-  if (!value) {
-    return null;
-  }
+  if (!value) return null;
 
   if (
     value.includes('@') &&
@@ -862,9 +827,8 @@ function rememberLid(session, lidJid, pnJid) {
     ) {
       session.lidMap.set(lidKey, phone);
     }
-
   } catch {
-    // Mapping bersifat best-effort.
+    // Mapping hanya bersifat best-effort.
   }
 }
 
@@ -886,9 +850,7 @@ function registerLidListeners(session, sock) {
 
     const onContacts = contacts => {
       for (const contact of contacts || []) {
-        if (
-          String(contact?.id || '').endsWith('@lid')
-        ) {
+        if (String(contact?.id || '').endsWith('@lid')) {
           rememberLid(
             session,
             contact.id,
@@ -924,7 +886,6 @@ async function resolvePhoneFromLid(
 ) {
   const key = msg?.key || {};
 
-  // 1. Coba field alternatif dari pesan.
   const candidates = [
     key.remoteJidAlt,
     key.senderPn,
@@ -942,16 +903,12 @@ async function resolvePhoneFromLid(
     }
   }
 
-  // 2. Coba cache mapping yang pernah dipelajari.
   const cached = session.lidMap?.get(
     jidUser(lidJid)
   );
 
-  if (cached) {
-    return cached;
-  }
+  if (cached) return cached;
 
-  // 3. Coba mapping bawaan Baileys jika tersedia.
   try {
     const mapping =
       session.socket?.signalRepository?.lidMapping;
@@ -992,13 +949,11 @@ async function resolvePhoneFromLid(
 }
 
 // ============================================================
-// HANDLE INCOMING MESSAGE
+// HANDLE INCOMING CHAT
 // ============================================================
 
 async function handleIncoming(session, msg) {
-  if (!msg?.key || msg.key.fromMe) {
-    return;
-  }
+  if (!msg?.key || msg.key.fromMe) return;
 
   const remoteJid = msg.key.remoteJid || '';
 
@@ -1042,8 +997,10 @@ async function handleIncoming(session, msg) {
     if (!phone) {
       logChat({
         session,
+        phone: remoteJid,
+        text,
         masuk: false,
-        hasil: 'Nomor pelanggan tidak tersedia dari WhatsApp (@lid)',
+        hasil: 'Nomor asli tidak tersedia dari WhatsApp (@lid)',
       });
 
       return;
@@ -1057,7 +1014,7 @@ async function handleIncoming(session, msg) {
     return;
   }
 
-  // Pesan tanpa ID tidak dapat dideduplikasi dengan aman.
+  // Deduplikasi pesan.
   const messageKey = msg.key.id;
 
   if (!messageKey) {
@@ -1070,35 +1027,38 @@ async function handleIncoming(session, msg) {
     return;
   }
 
-  // Deduplikasi pesan.
   const isNewMessage = await recordMessageOnce(
     session.sales.salesId,
     messageKey
   );
 
-  if (!isNewMessage) {
-    return;
-  }
+  if (!isNewMessage) return;
 
-  // Media tanpa caption tidak diproses sebagai lead.
-  if (!text) {
-    return;
-  }
+  // Media tanpa caption tidak dapat diekstrak sebagai teks.
+  if (!text) return;
 
-  const {
-    lead: extracted,
-    skipReason,
-  } = await extractLead({
+  const extractedResult = await extractLead({
     text,
     pushName,
     phone,
   });
 
+  const extracted =
+    extractedResult?.lead ?? extractedResult;
+
+  const skipReason =
+    extractedResult?.lead
+      ? extractedResult.skipReason
+      : null;
+
   if (!extracted) {
     logChat({
       session,
+      phone,
+      text,
       masuk: false,
-      hasil: skipReason ||
+      hasil:
+        skipReason ||
         'Chat tidak dikenali sebagai calon pembeli',
     });
 
@@ -1112,6 +1072,8 @@ async function handleIncoming(session, msg) {
 
   logChat({
     session,
+    phone,
+    text,
     extracted,
     masuk: true,
     hasil: actionLabel(result?.action),
@@ -1127,7 +1089,6 @@ export async function disconnectSales(
   logout = false
 ) {
   const id = String(salesId || '');
-
   const session = sessions.get(id);
 
   if (!session) {
@@ -1142,9 +1103,7 @@ export async function disconnectSales(
 
   const sock = session.socket;
 
-  // Invalidate seluruh event dari socket yang lama.
   session.socketGeneration++;
-
   session.socket = null;
 
   try {
@@ -1155,13 +1114,10 @@ export async function disconnectSales(
     } else {
       sock?.end(undefined);
     }
-
   } catch (err) {
     logError(
       'WA',
-      logout
-        ? 'Gagal logout WhatsApp'
-        : 'Gagal memutuskan koneksi WhatsApp',
+      'Gagal menutup sesi',
       err,
       label(session)
     );
@@ -1189,14 +1145,14 @@ export async function disconnectSales(
 
     logInfo(
       'WA',
-      'Sesi WhatsApp berhasil logout',
+      'WhatsApp berhasil logout',
       label(session)
     );
 
   } else {
     logInfo(
       'WA',
-      'Sesi WhatsApp berhasil diputus',
+      'WhatsApp berhasil disconnect',
       label(session)
     );
   }
@@ -1215,14 +1171,7 @@ export async function disconnectSales(
 // ============================================================
 
 export async function restoreSessions() {
-  if (restoring) {
-    logWarn(
-      'RESTORE',
-      'Pemulihan sesi sedang berjalan'
-    );
-
-    return;
-  }
+  if (restoring) return;
 
   restoring = true;
 
@@ -1242,7 +1191,6 @@ export async function restoreSessions() {
       entries = JSON.parse(
         fs.readFileSync(metadataPath, 'utf8')
       );
-
     } catch (err) {
       logError(
         'RESTORE',
@@ -1256,7 +1204,7 @@ export async function restoreSessions() {
     if (!Array.isArray(entries)) {
       logWarn(
         'RESTORE',
-        'Format metadata sesi bukan array'
+        'Format metadata tidak valid'
       );
 
       return;
@@ -1264,35 +1212,24 @@ export async function restoreSessions() {
 
     logInfo(
       'RESTORE',
-      `Memulai pemulihan ${entries.length} data sesi`
+      `Memulai pemulihan ${entries.length} sesi`
     );
 
     for (const item of entries) {
       try {
-        if (!item || item.enabled === false) {
-          continue;
-        }
+        if (!item || item.enabled === false) continue;
 
         const salesId = String(item.salesId || '');
 
-        if (!salesId) {
+        if (
+          !salesId ||
+          !item.salesName?.trim() ||
+          !item.branch?.trim()
+        ) {
           continue;
         }
 
         const folder = safeFolder(salesId);
-
-        if (
-          !item.salesName?.trim() ||
-          !item.branch?.trim()
-        ) {
-          logWarn(
-            'RESTORE',
-            'Data sales tidak lengkap, sesi dilewati',
-            salesId
-          );
-
-          continue;
-        }
 
         if (!fs.existsSync(folder)) {
           logWarn(
@@ -1316,10 +1253,7 @@ export async function restoreSessions() {
           branch: item.branch.trim(),
         });
 
-        // Sesi yang direstore belum tentu pernah pairing.
-        // startSocket akan memeriksa creds.registered.
         session.hasEverConnected = false;
-
         session.lastRequestedAt = Date.now();
 
         sessions.set(salesId, session);
@@ -1328,14 +1262,14 @@ export async function restoreSessions() {
 
         logInfo(
           'RESTORE',
-          'Pemulihan sesi diproses',
+          'Sesi dipulihkan',
           `${salesId} | ${label(session)}`
         );
 
       } catch (err) {
         logError(
           'RESTORE',
-          'Gagal memulihkan satu sesi, lanjut ke sesi berikutnya',
+          'Gagal memulihkan sesi, lanjut sesi berikutnya',
           err,
           String(item?.salesId || 'unknown')
         );
@@ -1344,13 +1278,13 @@ export async function restoreSessions() {
 
     logInfo(
       'RESTORE',
-      'Proses pemulihan seluruh sesi selesai'
+      'Pemulihan seluruh sesi selesai'
     );
 
   } catch (err) {
     logError(
       'RESTORE',
-      'Terjadi kesalahan pemulihan sesi',
+      'Terjadi kesalahan pemulihan',
       err
     );
 
