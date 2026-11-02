@@ -60,3 +60,35 @@ export async function upsertLead({ sales, extracted }) {
   const ref = await drafts.add(patch);
   return { id: ref.id, action: 'draft_created' };
 }
+
+// ------------------------------------------------------------
+// JAM CHAT TERAKHIR (dibaca dashboard web)
+// Dicatat oleh VPS untuk SEMUA chat pribadi (masuk & keluar), bukan cuma
+// yang terdeteksi sebagai lead. Satu dokumen per (sales, nomor customer):
+//   waChatTimes/{salesId}_{nomor}
+//   lastUserChatAt  = chat terakhir dari customer
+//   lastSalesChatAt = chat terakhir dari sales
+// Dashboard mencocokkannya ke leads lewat salesId + nomorWa.
+// ------------------------------------------------------------
+const lastWritten = new Map(); // `${docId}|${field}` -> ms, supaya tidak menulis mundur / dobel
+
+export async function recordChatTime({ sales, phone, fromMe, at }) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (!digits) return false;
+  const when = at instanceof Date && !Number.isNaN(at.getTime()) ? at : new Date();
+  const docId = `${sales.salesId}_${digits}`;
+  const field = fromMe ? 'lastSalesChatAt' : 'lastUserChatAt';
+  const cacheKey = `${docId}|${field}`;
+  if ((lastWritten.get(cacheKey) || 0) >= when.getTime()) return false;
+  lastWritten.set(cacheKey, when.getTime());
+  if (lastWritten.size > 5000) lastWritten.delete(lastWritten.keys().next().value);
+
+  await db.collection('waChatTimes').doc(docId).set({
+    salesId: sales.salesId,
+    branch: sales.branch || '',
+    nomorWa: digits,
+    [field]: when,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return true;
+}
