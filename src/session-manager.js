@@ -1,294 +1,814 @@
+
 import fs from 'node:fs';
 import path from 'node:path';
 import pino from 'pino';
 import QRCode from 'qrcode';
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
+
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+} from '@whiskeysockets/baileys';
+
 import { config } from './config.js';
 import { extractLead } from './extractor.js';
-import { recordChatTime, recordMessageOnce, upsertLead } from './firestore-leads.js';
 
-// Logger KHUSUS untuk Baileys -- dibikin silent supaya log internal
-// socket/websocket yang super detail (ratusan baris JSON teknis) tidak
-// membanjiri log server. Logger ini TIDAK dipakai untuk log aplikasi kita.
-const baileysLogger = pino({ level: 'silent' });
+import {
+  recordChatTime,
+  recordMessageOnce,
+  upsertLead,
+} from './firestore-leads.js';
 
-// Log aplikasi sendiri -- sengaja dibuat simpel & gampang dibaca,
-// format: [TAG] pesan | detail
+// ======================================================
+// LOGGER
+// ======================================================
+
+const baileysLogger = pino({
+  level: 'silent',
+});
+
 function log(tag, message, detail) {
-  const line = detail ? `[${tag}] ${message} | ${detail}` : `[${tag}] ${message}`;
+  const line = detail
+    ? `[${tag}] ${message} | ${detail}`
+    : `[${tag}] ${message}`;
+
   console.log(line);
 }
+
 function logError(tag, message, err, detail) {
-  const errMsg = err?.message || err;
-  const line = detail ? `[${tag}] ${message}: ${errMsg} | ${detail}` : `[${tag}] ${message}: ${errMsg}`;
+  const errMsg = err?.message || String(err || 'Unknown error');
+
+  const line = detail
+    ? `[${tag}] ${message}: ${errMsg} | ${detail}`
+    : `[${tag}] ${message}: ${errMsg}`;
+
   console.error(line);
 }
 
+function safeError(err) {
+  return String(err?.message || err || 'Unknown error')
+    .replace(/\s+/g, ' ')
+    .slice(0, 500);
+}
+
+// ======================================================
+// SESSION STORAGE
+// ======================================================
+
 const sessions = new Map();
-const metadataPath = path.join(config.dataDir, 'sales-sessions.json');
+
+const metadataPath = path.join(
+  config.dataDir,
+  'sales-sessions.json'
+);
+
 let restoring = false;
 
-// Kalau tidak ada yang minta/cek QR selama ini (sales menutup halaman
-// "Tautkan WhatsApp"), hentikan loop reconnect-buat-QR otomatis supaya
-// tidak jalan terus-menerus di background tanpa guna.
-const QR_IDLE_TIMEOUT_MS = Number(process.env.QR_IDLE_TIMEOUT_MS || 90000);
+const QR_IDLE_TIMEOUT_MS = Number(
+  process.env.QR_IDLE_TIMEOUT_MS || 90000
+);
+
+const RECONNECT_DELAY_MS = 3000;
 
 fs.mkdirSync(config.sessionsDir, { recursive: true });
 fs.mkdirSync(config.dataDir, { recursive: true });
 
+// ======================================================
+// SESSION HELPERS
+// ======================================================
+
 function safeFolder(salesId) {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(salesId)) throw new Error('salesId hanya boleh huruf, angka, _ atau -');
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(salesId)) {
+    throw new Error(
+      'salesId hanya boleh huruf, angka, _ atau -'
+    );
+  }
+
   return path.join(config.sessionsDir, salesId);
 }
+
 function saveMetadata() {
-  const data = [...sessions.values()].map(s => ({
-    salesId: s.sales.salesId,
-    salesName: s.sales.salesName,
-    branch: s.sales.branch,
-    enabled: s.enabled !== false,
+  const data = [...sessions.values()].map(session => ({
+    salesId: session.sales.salesId,
+    salesName: session.sales.salesName,
+    branch: session.sales.branch,
+    enabled: session.enabled !== false,
+    lastConnectedAt: session.lastConnectedAt || null,
+    lastDisconnectAt: session.lastDisconnectAt || null,
+    lastDisconnectCode: session.lastDisconnectCode || null,
+    lastError: session.lastError || null,
   }));
-  fs.writeFileSync(metadataPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+
+  const tempPath = `${metadataPath}.tmp`;
+
+  fs.writeFileSync(
+    tempPath,
+    JSON.stringify(data, null, 2),
+    { mode: 0o600 }
+  );
+
+  fs.renameSync(tempPath, metadataPath);
 }
-function statusOf(s) {
-  return { salesId: s.sales.salesId, salesName: s.sales.salesName, branch: s.sales.branch, connected: Boolean(s.connected), hasQr: Boolean(s.qr), phone: s.phone || null, enabled: s.enabled !== false };
+
+function statusOf(session) {
+  let status = 'NOT_CONNECTED';
+
+  if (session.connected) {
+    status = 'CONNECTED';
+  } else if (session.hasQr) {
+    status = 'QR_REQUIRED';
+  } else if (session.starting) {
+    status = 'CONNECTING';
+  } else if (session.error || session.lastError) {
+    status = 'ERROR';
+  } else if (session.enabled === false) {
+    status = 'DISCONNECTED';
+  } else if (session.enabled) {
+    status = 'CONNECTING';
+  }
+
+  return {
+    salesId: session.sales.salesId,
+    salesName: session.sales.salesName,
+    branch: session.sales.branch,
+
+    status,
+
+    connected: Boolean(session.connected),
+    hasQr: Boolean(session.qr),
+    enabled: session.enabled !== false,
+    starting: Boolean(session.starting),
+
+    phone: session.phone || null,
+
+    lastConnectedAt: session.lastConnectedAt || null,
+    connectedAt: session.lastConnectedAt || null,
+    connectingSince: session.connectingSince || null,
+    lastDisconnectAt: session.lastDisconnectAt || null,
+    lastDisconnectCode: session.lastDisconnectCode || null,
+
+    error: session.error || null,
+    lastError: session.lastError || null,
+
+    hasEverConnected: Boolean(session.hasEverConnected),
+  };
 }
+
 function label(session) {
   return `${session.sales.salesName}/${session.sales.branch}`;
 }
 
-export function listSessions() { return [...sessions.values()].map(statusOf); }
-export function getSession(salesId) { const s = sessions.get(salesId); return s ? statusOf(s) : null; }
+function isCurrentSession(session) {
+  return sessions.get(session.sales.salesId) === session;
+}
+
+function clearReconnectTimer(session) {
+  if (session.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = null;
+  }
+}
+
+function setSessionError(session, err) {
+  const message = safeError(err);
+
+  session.error = message;
+  session.lastError = message;
+  session.updatedAt = new Date().toISOString();
+
+  try {
+    saveMetadata();
+  } catch (saveErr) {
+    logError('WA', 'Gagal menyimpan metadata error', saveErr, label(session));
+  }
+}
+
+// ======================================================
+// PUBLIC SESSION FUNCTIONS
+// ======================================================
+
+export function listSessions() {
+  return [...sessions.values()].map(statusOf);
+}
+
+export function getSession(salesId) {
+  const session = sessions.get(salesId);
+
+  return session ? statusOf(session) : null;
+}
+
 export function getQr(salesId) {
-  const s = sessions.get(salesId);
-  if (!s) return null;
-  // SENGAJA tidak touchSession() di sini -- ini dipanggil oleh polling
-  // background tiap 3 detik dari app, kalau ikut memperpanjang jam idle
-  // maka QR akan terus dibuat ulang selama halaman terbuka, walau sales
-  // sudah tidak aktif. Jam idle hanya diperpanjang oleh AKSI EKSPLISIT
-  // (tombol "Tampilkan QR" / "Muat ulang QR" ditekan), lihat connectSales().
-  return s.qr || null;
+  const session = sessions.get(salesId);
+
+  if (!session) return null;
+
+  return session.qr || null;
 }
 
-// Dipanggil hanya dari aksi eksplisit sales (tekan tombol connect),
-// BUKAN dari polling pasif -- lihat komentar di getQr().
+// Dipanggil hanya saat Sales melakukan aksi eksplisit.
 export function touchSession(salesId) {
-  const s = sessions.get(salesId);
-  if (s) s.lastRequestedAt = Date.now();
+  const session = sessions.get(salesId);
+
+  if (session) {
+    session.lastRequestedAt = Date.now();
+  }
 }
 
-export async function connectSales({ salesId, salesName, branch }) {
-  const folder = safeFolder(String(salesId || ''));
-  if (!salesName?.trim() || !branch?.trim()) throw new Error('salesName dan branch wajib diisi');
-  const sales = { salesId: String(salesId), salesName: salesName.trim(), branch: branch.trim() };
-  let current = sessions.get(sales.salesId);
+// ======================================================
+// CREATE / CONNECT SESSION
+// ======================================================
+
+export async function connectSales({
+  salesId,
+  salesName,
+  branch,
+}) {
+  const id = String(salesId || '');
+
+  const folder = safeFolder(id);
+
+  if (!salesName?.trim() || !branch?.trim()) {
+    throw new Error('salesName dan branch wajib diisi');
+  }
+
+  const sales = {
+    salesId: id,
+    salesName: salesName.trim(),
+    branch: branch.trim(),
+  };
+
+  let current = sessions.get(id);
+
   if (current?.starting || current?.connected) {
     current.sales = sales;
     current.enabled = true;
     current.lastRequestedAt = Date.now();
+
     saveMetadata();
+
     return statusOf(current);
   }
+
   if (!current) {
     current = {
-      sales, connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
-      hasEverConnected: false, lastRequestedAt: Date.now(),
+      sales,
+
+      connected: false,
+      qr: null,
+      phone: null,
+
+      enabled: true,
+      starting: false,
+      socket: null,
+
+      hasEverConnected: false,
+
+      lastRequestedAt: Date.now(),
+
+      lastConnectedAt: null,
+      connectingSince: null,
+      lastDisconnectAt: null,
+      lastDisconnectCode: null,
+
+      error: null,
+      lastError: null,
+
+      reconnectTimer: null,
     };
-    sessions.set(sales.salesId, current);
+
+    sessions.set(id, current);
   } else {
     current.sales = sales;
     current.enabled = true;
     current.lastRequestedAt = Date.now();
+
+    current.error = null;
+
+    clearReconnectTimer(current);
   }
+
   saveMetadata();
+
   await startSocket(current, folder);
+
   return statusOf(current);
 }
 
+// ======================================================
+// RECONNECT SCHEDULER
+// ======================================================
+
+function scheduleReconnect(session, folder, delay = RECONNECT_DELAY_MS) {
+  if (!isCurrentSession(session)) return;
+  if (!session.enabled) return;
+  if (session.reconnectTimer) return;
+
+  session.reconnectTimer = setTimeout(async () => {
+    session.reconnectTimer = null;
+
+    if (!isCurrentSession(session) || !session.enabled) {
+      return;
+    }
+
+    if (session.starting || session.connected) {
+      return;
+    }
+
+    log('WA', 'Menjalankan reconnect', label(session));
+
+    try {
+      await startSocket(session, folder);
+    } catch (err) {
+      setSessionError(session, err);
+
+      logError(
+        'WA',
+        'Reconnect gagal',
+        err,
+        label(session)
+      );
+
+      scheduleReconnect(session, folder);
+    }
+  }, delay);
+
+  session.reconnectTimer.unref?.();
+}
+
+// ======================================================
+// START SOCKET
+// ======================================================
+
 async function startSocket(session, folder) {
-  if (session.starting) return;
+  if (!isCurrentSession(session)) return;
+  if (!session.enabled) return;
+  if (session.starting || session.connected) return;
+
   session.starting = true;
+  session.connectingSince = new Date().toISOString();
+  session.error = null;
+
   try {
     const { state, saveCreds } = await useMultiFileAuthState(folder);
 
-    // `creds.registered` adalah penanda resmi dari Baileys: true hanya
-    // kalau proses pairing WA ini PERNAH berhasil sebelumnya (file
-    // kredensial valid tersimpan di folder sesi). Dipakai untuk membedakan
-    // sesi yang "sudah pernah discan sales" (boleh auto-reconnect terus
-    // walau idle, wajar dipulihkan kalau cuma putus jaringan) dari sesi
-    // yang "belum pernah discan sama sekali" (harus tunduk ke jam idle,
-    // supaya tidak auto-generate QR selamanya tanpa ada yang minta).
+    if (!isCurrentSession(session) || !session.enabled) {
+      return;
+    }
+
     if (state.creds?.registered) {
       session.hasEverConnected = true;
     }
 
     const sock = makeWASocket({
       auth: state,
-      logger: baileysLogger, // logger silent khusus baileys, bukan logger aplikasi
+      logger: baileysLogger,
+
       printQRInTerminal: false,
-      browser: ['Erra Auto Lead', 'Chrome', '1.0.0'],
+
+      browser: [
+        'Erra Auto Lead',
+        'Chrome',
+        '1.0.0',
+      ],
+
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
     });
+
     session.socket = sock;
+
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
-      if (qr) {
-        try {
-          session.qr = await QRCode.toDataURL(qr);
-          log('WA', 'QR baru dibuat', label(session));
-        } catch (e) {
-          logError('WA', 'Gagal membuat QR', e, label(session));
-        }
-      }
-      if (connection === 'open') {
-        session.connected = true;
-        session.qr = null;
-        session.hasEverConnected = true;
-        session.phone = sock.user?.id?.split(':')[0]?.split('@')[0] || null;
-        log('WA', 'Terhubung', `${label(session)} (${session.phone})`);
-      }
-      if (connection === 'close') {
-        session.connected = false;
-        session.qr = null;
-        const code = lastDisconnect?.error?.output?.statusCode;
-        log('WA', `TERPUTUS kode=${code}`, label(session));
+    // ==================================================
+    // CONNECTION UPDATE
+    // ==================================================
 
-        if (!session.enabled || code === DisconnectReason.loggedOut) {
-          return; // sesi memang dimatikan / logout -- jangan reconnect
-        }
-
-        // Sesi yang SUDAH PERNAH terhubung tetap direconnect otomatis
-        // seperti biasa -- wajar dipulihkan kalau cuma putus jaringan.
-        if (session.hasEverConnected) {
-          log('WA', 'reconnect dalam 3 dtk', label(session));
-          setTimeout(() => startSocket(session, folder).catch(err => logError('WA', 'Reconnect gagal', err, label(session))), 3000);
+    sock.ev.on(
+      'connection.update',
+      async ({ connection, qr, lastDisconnect }) => {
+        if (!isCurrentSession(session) || session.socket !== sock) {
           return;
         }
 
-        // Sesi BELUM PERNAH terhubung -- hanya lanjut buat QR baru kalau
-        // masih ada yang aktif minta/lihat QR dalam QR_IDLE_TIMEOUT_MS
-        // terakhir. Kalau tidak, berhenti sampai sales buka lagi
-        // halamannya / tekan tombol "Tampilkan QR".
-        const idleFor = Date.now() - (session.lastRequestedAt || 0);
-        if (idleFor < QR_IDLE_TIMEOUT_MS) {
-          log('WA', 'reconnect dalam 3 dtk', label(session));
-          setTimeout(() => startSocket(session, folder).catch(err => logError('WA', 'Reconnect gagal', err, label(session))), 3000);
-        } else {
-          log('WA', 'idle, hentikan auto-QR (tekan tombol untuk coba lagi)', label(session));
-          session.socket = null;
-        }
-      }
-    });
+        // ------------------------------
+        // QR GENERATED
+        // ------------------------------
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') {
-        // Chat yang sales ketik dari HP-nya sering datang sebagai 'append'.
-        // Jam chat-nya tetap dicatat kalau pesannya baru (bukan sinkron riwayat lama).
-        if (type === 'append') {
-          for (const msg of messages) {
-            if (msg?.key?.fromMe && isRecentMessage(msg)) await trackChatTime(session, msg);
+        if (qr) {
+          try {
+            session.qr = await QRCode.toDataURL(qr);
+
+            session.error = null;
+
+            log(
+              'WA',
+              'QR baru dibuat',
+              label(session)
+            );
+          } catch (err) {
+            setSessionError(session, err);
+
+            logError(
+              'WA',
+              'Gagal membuat QR',
+              err,
+              label(session)
+            );
           }
         }
-        log('MSG', `SKIP type=${type}`, label(session));
-        return;
+
+        // ------------------------------
+        // CONNECTED
+        // ------------------------------
+
+        if (connection === 'open') {
+          session.connected = true;
+          session.qr = null;
+
+          session.hasEverConnected = true;
+
+          session.phone =
+            sock.user?.id
+              ?.split(':')[0]
+              ?.split('@')[0] || null;
+
+          session.lastConnectedAt = new Date().toISOString();
+
+          session.connectingSince = null;
+
+          session.error = null;
+          session.lastError = null;
+
+          session.lastDisconnectCode = null;
+
+          clearReconnectTimer(session);
+
+          try {
+            saveMetadata();
+          } catch (err) {
+            logError(
+              'WA',
+              'Gagal menyimpan metadata koneksi',
+              err,
+              label(session)
+            );
+          }
+
+          log(
+            'WA',
+            'Terhubung',
+            `${label(session)} (${session.phone || 'nomor tidak tersedia'})`
+          );
+        }
+
+        // ------------------------------
+        // DISCONNECTED
+        // ------------------------------
+
+        if (connection === 'close') {
+          session.connected = false;
+          session.qr = null;
+          session.connectingSince = null;
+
+          session.lastDisconnectAt = new Date().toISOString();
+
+          const code =
+            lastDisconnect?.error?.output?.statusCode ?? null;
+
+          session.lastDisconnectCode = code;
+
+          const disconnectMessage = safeError(
+            lastDisconnect?.error || `Connection closed (${code})`
+          );
+
+          session.error = disconnectMessage;
+          session.lastError = disconnectMessage;
+
+          session.socket = null;
+
+          try {
+            saveMetadata();
+          } catch (err) {
+            logError(
+              'WA',
+              'Gagal menyimpan metadata disconnect',
+              err,
+              label(session)
+            );
+          }
+
+          log(
+            'WA',
+            `TERPUTUS kode=${code}`,
+            label(session)
+          );
+
+          if (
+            !session.enabled ||
+            code === DisconnectReason.loggedOut
+          ) {
+            if (code === DisconnectReason.loggedOut) {
+              session.error = 'WhatsApp logout. Perlu scan QR ulang.';
+              session.lastError = session.error;
+
+              try {
+                saveMetadata();
+              } catch {}
+            }
+
+            log(
+              'WA',
+              'Reconnect dihentikan',
+              `${label(session)} | ${!session.enabled ? 'sesi dinonaktifkan' : 'loggedOut'}`
+            );
+
+            return;
+          }
+
+          // ------------------------------
+          // SESSION ALREADY PAIRED
+          // ------------------------------
+
+          if (session.hasEverConnected) {
+            log(
+              'WA',
+              'Reconnect dijadwalkan',
+              label(session)
+            );
+
+            scheduleReconnect(session, folder);
+            return;
+          }
+
+          // ------------------------------
+          // SESSION NOT PAIRED YET
+          // ------------------------------
+
+          const idleFor =
+            Date.now() - (session.lastRequestedAt || 0);
+
+          if (idleFor < QR_IDLE_TIMEOUT_MS) {
+            log(
+              'WA',
+              'Reconnect QR dijadwalkan',
+              label(session)
+            );
+
+            scheduleReconnect(session, folder);
+          } else {
+            log(
+              'WA',
+              'Idle, auto-QR dihentikan',
+              label(session)
+            );
+
+            session.socket = null;
+
+            try {
+              saveMetadata();
+            } catch {}
+          }
+        }
       }
-      log('MSG', `upsert type=notify jumlah=${messages.length}`, label(session));
-      for (const msg of messages) {
-        await trackChatTime(session, msg);
-        try { await handleIncoming(session, msg); }
-        catch (err) { logError('MSG', 'Gagal memproses chat masuk', err, label(session)); }
+    );
+
+    // ==================================================
+    // INCOMING MESSAGES
+    // ==================================================
+
+    sock.ev.on(
+      'messages.upsert',
+      async ({ messages, type }) => {
+        if (!isCurrentSession(session) || session.socket !== sock) {
+          return;
+        }
+
+        if (type !== 'notify') {
+          if (type === 'append') {
+            for (const msg of messages) {
+              if (
+                msg?.key?.fromMe &&
+                isRecentMessage(msg)
+              ) {
+                await trackChatTime(session, msg);
+              }
+            }
+          }
+
+          log(
+            'MSG',
+            `SKIP type=${type}`,
+            label(session)
+          );
+
+          return;
+        }
+
+        log(
+          'MSG',
+          `upsert type=notify jumlah=${messages.length}`,
+          label(session)
+        );
+
+        for (const msg of messages) {
+          if (!isCurrentSession(session) || session.socket !== sock) {
+            return;
+          }
+
+          await trackChatTime(session, msg);
+
+          try {
+            await handleIncoming(session, msg);
+          } catch (err) {
+            logError(
+              'MSG',
+              'Gagal memproses chat masuk',
+              err,
+              label(session)
+            );
+          }
+        }
       }
-    });
+    );
+
+  } catch (err) {
+    setSessionError(session, err);
+
+    logError(
+      'WA',
+      'Gagal memulai socket',
+      err,
+      label(session)
+    );
+
+    if (session.hasEverConnected && session.enabled) {
+      scheduleReconnect(session, folder);
+    }
+
+    throw err;
+
   } finally {
     session.starting = false;
+
+    if (!session.connected) {
+      session.connectingSince = null;
+    }
   }
 }
 
+// ======================================================
+// MESSAGE TEXT
+// ======================================================
+
 function getMessageText(msg) {
   const m = msg.message || {};
-  return m.conversation
-    || m.extendedTextMessage?.text
-    || m.imageMessage?.caption
-    || m.videoMessage?.caption
-    || m.documentMessage?.caption
-    || m.buttonsResponseMessage?.selectedDisplayText
-    || m.listResponseMessage?.title
-    || '';
+
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    ''
+  );
 }
 
-// WhatsApp "Linked ID" (@lid): format JID baru untuk kontak yang belum
-// tersimpan di address book pengirim (atau akun bisnis). Angka di depan
-// "@lid" BUKAN nomor telepon asli -- harus di-resolve dulu lewat mapping
-// internal Baileys. Nama API persis berbeda-beda antar versi Baileys
-// (fitur ini masih terus berubah di WhatsApp/Baileys), jadi dicoba
-// beberapa kemungkinan secara defensif. Kalau semua gagal, fungsi ini
-// mengembalikan null dan pesan akan di-skip dengan log yang jelas.
+// ======================================================
+// WHATSAPP LID RESOLVER
+// ======================================================
+
 async function resolvePhoneFromLid(sock, msg) {
   const key = msg.key || {};
+
   const lidJid = key.remoteJid || '';
 
-  // Cara 1: beberapa versi Baileys menaruh versi nomor-telepon-asli
-  // berdampingan dengan JID @lid, langsung di field pesan itu sendiri
-  // (nama field berbeda-beda antar versi, dicoba semua kemungkinan).
-  const altCandidates = [key.remoteJidAlt, key.senderPn, key.participantAlt, key.participantPn, msg.verifiedBizName];
+  const altCandidates = [
+    key.remoteJidAlt,
+    key.senderPn,
+    key.participantAlt,
+    key.participantPn,
+    msg.verifiedBizName,
+  ];
+
   for (const candidate of altCandidates) {
-    if (typeof candidate === 'string' && candidate.endsWith('@s.whatsapp.net')) {
-      const phone = candidate.split('@')[0].replace(/\D/g, '');
+    if (
+      typeof candidate === 'string' &&
+      candidate.endsWith('@s.whatsapp.net')
+    ) {
+      const phone = candidate
+        .split('@')[0]
+        .replace(/\D/g, '');
+
       if (phone) return phone;
     }
   }
 
-  // Cara 2: lewat signalRepository.lidMapping (kalau versi Baileys-nya
-  // mendukung -- diketahui dari log DEBUG sebelumnya versi kamu TIDAK
-  // punya ini, tapi tetap dicoba untuk jaga-jaga kalau nanti di-update).
   try {
     const mapping = sock?.signalRepository?.lidMapping;
+
     const resolved =
       (await mapping?.getPNForLID?.(lidJid)) ||
       (await mapping?.getPNForLid?.(lidJid)) ||
       null;
+
     if (resolved) {
-      const phone = String(resolved).split('@')[0].replace(/\D/g, '');
+      const phone = String(resolved)
+        .split('@')[0]
+        .replace(/\D/g, '');
+
       if (phone) return phone;
     }
   } catch (err) {
-    logError('MSG', 'Gagal resolve @lid lewat lidMapping', err, lidJid);
+    logError(
+      'MSG',
+      'Gagal resolve @lid lewat lidMapping',
+      err,
+      lidJid
+    );
   }
 
-  // Semua cara gagal -- dump seluruh field di key pesan (bukan seluruh
-  // pesan, supaya tidak kepanjangan) supaya kelihatan field apa saja yang
-  // sebenarnya dikirim WhatsApp untuk pesan @lid ini.
-  log('MSG', 'DEBUG @lid: semua cara resolve gagal, isi msg.key', JSON.stringify(key));
+  log(
+    'MSG',
+    'DEBUG @lid: resolve gagal',
+    JSON.stringify(key)
+  );
+
   return null;
 }
 
-// Waktu pesan dari WhatsApp (detik, bisa bertipe Long) -> Date.
+// ======================================================
+// MESSAGE DATE
+// ======================================================
+
 function messageDate(msg) {
-  const n = Number(msg?.messageTimestamp?.toString?.() ?? msg?.messageTimestamp);
-  if (!Number.isFinite(n) || n <= 0) return new Date();
-  const d = new Date(n * 1000);
-  return d.getTime() > Date.now() + 5 * 60 * 1000 ? new Date() : d;
-}
-function isRecentMessage(msg, maxAgeMs = 10 * 60 * 1000) {
-  return Date.now() - messageDate(msg).getTime() <= maxAgeMs;
+  const n = Number(
+    msg?.messageTimestamp?.toString?.() ??
+    msg?.messageTimestamp
+  );
+
+  if (!Number.isFinite(n) || n <= 0) {
+    return new Date();
+  }
+
+  const date = new Date(n * 1000);
+
+  return date.getTime() > Date.now() + 5 * 60 * 1000
+    ? new Date()
+    : date;
 }
 
-// Catat jam chat terakhir (customer / sales) ke Firestore untuk dashboard.
-// Jalan untuk semua chat pribadi, terlepas dari hasil ekstraksi lead.
+function isRecentMessage(
+  msg,
+  maxAgeMs = 10 * 60 * 1000
+) {
+  return (
+    Date.now() - messageDate(msg).getTime() <= maxAgeMs
+  );
+}
+
+// ======================================================
+// TRACK CHAT TIME
+// ======================================================
+
 async function trackChatTime(session, msg) {
   try {
     if (!msg?.key) return;
+
     const jid = msg.key.remoteJid || '';
-    if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
+
+    if (
+      jid.endsWith('@g.us') ||
+      jid.endsWith('@broadcast') ||
+      jid.endsWith('@newsletter')
+    ) {
+      return;
+    }
+
     const kinds = Object.keys(msg.message || {});
-    const sistem = ['protocolMessage', 'senderKeyDistributionMessage', 'messageContextInfo'];
-    if (!kinds.length || kinds.every(k => sistem.includes(k))) return;
+
+    const systemMessages = [
+      'protocolMessage',
+      'senderKeyDistributionMessage',
+      'messageContextInfo',
+    ];
+
+    if (
+      !kinds.length ||
+      kinds.every(kind => systemMessages.includes(kind))
+    ) {
+      return;
+    }
 
     let phone = null;
-    if (jid.endsWith('@s.whatsapp.net')) phone = jid.split('@')[0].replace(/\D/g, '');
-    else if (jid.endsWith('@lid')) phone = await resolvePhoneFromLid(session.socket, msg);
+
+    if (jid.endsWith('@s.whatsapp.net')) {
+      phone = jid.split('@')[0].replace(/\D/g, '');
+    } else if (jid.endsWith('@lid')) {
+      phone = await resolvePhoneFromLid(session.socket, msg);
+    }
+
     if (!phone || phone === session.phone) return;
 
     await recordChatTime({
@@ -297,15 +817,22 @@ async function trackChatTime(session, msg) {
       fromMe: Boolean(msg.key.fromMe),
       at: messageDate(msg),
     });
+
   } catch (err) {
-    logError('CHAT', 'Gagal mencatat jam chat', err, label(session));
+    logError(
+      'CHAT',
+      'Gagal mencatat jam chat',
+      err,
+      label(session)
+    );
   }
 }
 
+// ======================================================
+// HANDLE INCOMING MESSAGE
+// ======================================================
+
 async function handleIncoming(session, msg) {
-  // Diagnostik paling awal -- supaya kelihatan kalaupun pesan ke-skip di
-  // pengecekan paling pertama (fromMe, tanpa key, dll), yang mana sebelum
-  // ini TIDAK ada log-nya sama sekali kalau ke-skip di sini.
   log(
     'MSG',
     'DEBUG diterima',
@@ -313,56 +840,101 @@ async function handleIncoming(session, msg) {
   );
 
   if (!msg?.key || msg.key.fromMe) return;
+
   const remoteJid = msg.key.remoteJid || '';
-  if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@broadcast') || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) {
+
+  if (
+    remoteJid.endsWith('@g.us') ||
+    remoteJid.endsWith('@broadcast') ||
+    remoteJid === 'status@broadcast' ||
+    remoteJid.endsWith('@newsletter')
+  ) {
     return;
   }
 
-  const text = getMessageText(msg).trim();
+  const messageText = getMessageText(msg).trim();
 
-  // Resolve nomor pengirim dari JID. Untuk @lid (kontak belum tersimpan
-  // di address book), angka di JID BUKAN nomor asli -- coba resolve dulu.
   let phone = null;
   let phoneIssue = null;
+
   if (remoteJid.endsWith('@s.whatsapp.net')) {
-    phone = remoteJid.split('@')[0].replace(/\D/g, '');
+    phone = remoteJid
+      .split('@')[0]
+      .replace(/\D/g, '');
+
   } else if (remoteJid.endsWith('@lid')) {
     phone = await resolvePhoneFromLid(session.socket, msg);
-    if (!phone) phoneIssue = 'gagal resolve @lid';
+
+    if (!phone) {
+      phoneIssue = 'gagal resolve @lid';
+    }
+
   } else {
     phoneIssue = `jid tidak dikenali (${remoteJid})`;
   }
 
   let skip = null;
-  if (!phone) skip = phoneIssue || 'nomor tidak diketahui';
-  else if (phone === session.phone) skip = 'nomor sama dengan nomor toko sendiri';
-  else if (msg.key.id && !(await recordMessageOnce(session.sales.salesId, msg.key.id))) skip = 'duplikat, sudah pernah diproses';
-  else if (!text) skip = 'tanpa teks/caption (media)';
+
+  if (!phone) {
+    skip = phoneIssue || 'nomor tidak diketahui';
+
+  } else if (phone === session.phone) {
+    skip = 'nomor sama dengan nomor toko sendiri';
+
+  } else if (
+    msg.key.id &&
+    !(await recordMessageOnce(
+      session.sales.salesId,
+      msg.key.id
+    ))
+  ) {
+    skip = 'duplikat, sudah pernah diproses';
+
+  } else if (!messageText) {
+    skip = 'tanpa teks/caption (media)';
+  }
 
   let extracted = null;
   let method = null;
   let fallbackReason = null;
+
   if (!skip) {
-    ({ lead: extracted, method, fallbackReason } = await extractLead({ text, pushName: msg.pushName || '', phone }));
+    ({
+      lead: extracted,
+      method,
+      fallbackReason,
+    } = await extractLead({
+      text: messageText,
+      pushName: msg.pushName || '',
+      phone,
+    }));
   }
 
-  const methodLabel = method === 'gemini' ? 'gemini' : 'manual';
-  const diextrak = skip
+  const methodLabel =
+    method === 'gemini' ? 'gemini' : 'manual';
+
+  const extractionResult = skip
     ? `tidak diproses (${skip})`
     : !extracted
       ? `diabaikan, bukan lead (${methodLabel}${fallbackReason ? `, gemini gagal: ${fallbackReason}` : ''})`
       : `${methodLabel}${fallbackReason ? ` (gemini gagal: ${fallbackReason})` : ''}`;
 
-  // Satu baris ringkas per pesan masuk: isi pesan, nomor wa, hasil ekstraksi.
-  log('CHAT', `pesan masuk="${text || '-'}"`, `no wa=${phone || '-'} | ${label(session)} | diextrak=${diextrak}`);
+  // Log chat masuk tetap menampilkan isi pesan.
+  // Hati-hati: log ini berisi data percakapan pelanggan.
+  log(
+    'CHAT',
+    `pesan masuk="${messageText || '-'}"`,
+    `no wa=${phone || '-'} | ${label(session)} | diextrak=${extractionResult}`
+  );
 
   if (skip || !extracted) return;
 
-  // Ini cuma nyimpen DRAFT (collection waLeadDrafts) buat auto-isi form
-  // "Tambah Lead" -- BUKAN langsung jadi lead beneran di collection
-  // "leads". Lead baru benar-benar tercatat kalau sales menekan tombol
-  // Simpan di app (lihat add_lead_screen.dart).
-  const result = await upsertLead({ sales: session.sales, extracted });
+  // Simpan draft untuk form Tambah Lead.
+  const result = await upsertLead({
+    sales: session.sales,
+    extracted,
+  });
+
   log(
     'DRAFT',
     `${result.action} id=${result.id}`,
@@ -370,46 +942,204 @@ async function handleIncoming(session, msg) {
   );
 }
 
-export async function disconnectSales(salesId, logout = false) {
-  const s = sessions.get(salesId);
-  if (!s) throw new Error('Sesi sales tidak ditemukan');
-  s.enabled = false;
-  s.connected = false;
-  s.qr = null;
-  try {
-    if (logout) await s.socket?.logout();
-    else s.socket?.end(undefined);
-  } catch (err) { logError('WA', 'Penutupan sesi', err, salesId); }
-  if (logout) {
-    fs.rmSync(safeFolder(salesId), { recursive: true, force: true });
-    sessions.delete(salesId);
+// ======================================================
+// DISCONNECT / LOGOUT
+// ======================================================
+
+export async function disconnectSales(
+  salesId,
+  logout = false
+) {
+  const session = sessions.get(salesId);
+
+  if (!session) {
+    throw new Error('Sesi sales tidak ditemukan');
   }
-  saveMetadata();
-  return { salesId, disconnected: true, loggedOut: logout };
+
+  session.enabled = false;
+  session.connected = false;
+  session.qr = null;
+  session.connectingSince = null;
+
+  clearReconnectTimer(session);
+
+  try {
+    if (logout) {
+      await session.socket?.logout();
+    } else {
+      session.socket?.end(undefined);
+    }
+  } catch (err) {
+    logError(
+      'WA',
+      'Penutupan sesi',
+      err,
+      salesId
+    );
+  }
+
+  session.socket = null;
+
+  if (logout) {
+    fs.rmSync(
+      safeFolder(salesId),
+      {
+        recursive: true,
+        force: true,
+      }
+    );
+
+    sessions.delete(salesId);
+
+  } else {
+    session.lastDisconnectAt = new Date().toISOString();
+    session.error = null;
+
+    try {
+      saveMetadata();
+    } catch (err) {
+      logError(
+        'WA',
+        'Gagal menyimpan metadata disconnect',
+        err,
+        salesId
+      );
+    }
+  }
+
+  if (logout) {
+    saveMetadata();
+  }
+
+  log(
+    'WA',
+    logout ? 'Logout berhasil' : 'Disconnect berhasil',
+    salesId
+  );
+
+  return {
+    salesId,
+    disconnected: true,
+    loggedOut: logout,
+  };
 }
+
+// ======================================================
+// RESTORE SESSIONS
+// ======================================================
 
 export async function restoreSessions() {
   if (restoring) return;
+
   restoring = true;
+
   try {
-    if (!fs.existsSync(metadataPath)) return;
-    const entries = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-    for (const item of entries) {
-      if (item.enabled === false) continue;
-      const s = {
-        sales: { salesId: item.salesId, salesName: item.salesName, branch: item.branch },
-        connected: false, qr: null, phone: null, enabled: true, starting: false, socket: null,
-        // JANGAN di-hardcode true di sini -- startSocket() di bawah akan
-        // menentukan nilai sebenarnya dari creds.registered begitu folder
-        // sesinya dibaca. Sesi yang BELUM pernah discan (creds.registered
-        // masih false) harus tetap tunduk ke jam idle, bukan dianggap
-        // "sudah terhubung" cuma karena pernah tersimpan di metadata.
-        hasEverConnected: false,
-        lastRequestedAt: Date.now(),
-      };
-      sessions.set(item.salesId, s);
-      await startSocket(s, safeFolder(item.salesId));
+    if (!fs.existsSync(metadataPath)) {
+      log('WA', 'Metadata sesi belum tersedia');
+      return;
     }
-  } catch (err) { logError('WA', 'Gagal memulihkan sesi', err); }
-  finally { restoring = false; }
+
+    const entries = JSON.parse(
+      fs.readFileSync(metadataPath, 'utf8')
+    );
+
+    if (!Array.isArray(entries)) {
+      throw new Error('Format metadata sesi tidak valid');
+    }
+
+    for (const item of entries) {
+      try {
+        if (item.enabled === false) continue;
+
+        if (!item.salesId) {
+          log(
+            'WA',
+            'Metadata dilewati karena salesId kosong'
+          );
+          continue;
+        }
+
+        const id = String(item.salesId);
+
+        if (sessions.has(id)) continue;
+
+        const session = {
+          sales: {
+            salesId: id,
+            salesName: item.salesName || `Sales ${id.slice(0, 6)}`,
+            branch: item.branch || 'Belum diatur',
+          },
+
+          connected: false,
+          qr: null,
+          phone: null,
+
+          enabled: true,
+          starting: false,
+          socket: null,
+
+          hasEverConnected: false,
+          lastRequestedAt: Date.now(),
+
+          lastConnectedAt: item.lastConnectedAt || null,
+          connectingSince: null,
+          lastDisconnectAt: item.lastDisconnectAt || null,
+          lastDisconnectCode: item.lastDisconnectCode || null,
+
+          error: null,
+          lastError: item.lastError || null,
+
+          reconnectTimer: null,
+        };
+
+        sessions.set(id, session);
+
+        log(
+          'WA',
+          'Memulihkan sesi',
+          label(session)
+        );
+
+        try {
+          await startSocket(
+            session,
+            safeFolder(id)
+          );
+        } catch (err) {
+          setSessionError(session, err);
+
+          logError(
+            'WA',
+            'Gagal memulihkan sesi',
+            err,
+            label(session)
+          );
+        }
+
+      } catch (err) {
+        logError(
+          'WA',
+          'Gagal memulihkan salah satu akun',
+          err,
+          item?.salesId || '-'
+        );
+      }
+    }
+
+    log(
+      'WA',
+      'Proses restore selesai',
+      `total metadata=${entries.length}`
+    );
+
+  } catch (err) {
+    logError(
+      'WA',
+      'Gagal membaca metadata sesi',
+      err
+    );
+
+  } finally {
+    restoring = false;
+  }
 }
