@@ -92,3 +92,22 @@ export async function recordChatTime({ sales, phone, fromMe, at }) {
   }, { merge: true });
   return true;
 }
+
+// ------------------------------------------------------------
+// MONITORING AKUN WA (dibaca halaman "Monitoring akun" di dashboard)
+//   waSessions/{salesId}  = status koneksi WhatsApp tiap sales
+//   waServer/status       = detak jantung (heartbeat) server VPS
+// ------------------------------------------------------------
+export async function publishSessionDoc(salesId, data) {
+  await db.collection('waSessions').doc(salesId).set(
+    { ...data, updatedAt: FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+}
+
+export async function publishServerHeartbeat(data) {
+  await db.collection('waServer').doc('status').set(
+    { ...data, heartbeatAt: FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+}
