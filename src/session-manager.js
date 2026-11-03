@@ -117,8 +117,13 @@ function syncSession(s) {
   }, 5000);
   s._syncTimer.unref?.();
   s.dirtyChat = false;
-  publishSessionDoc(s.sales.salesId, sessionPayload(s))
-    .catch(err => logError('MON', 'Gagal publish status sesi', err, label(s)));
+  const payload = sessionPayload(s);
+  // Lewati kalau isinya sama dengan yang terakhir dikirim (hemat tulis).
+  const sig = JSON.stringify(payload);
+  if (sig === s._lastSig) return;
+  s._lastSig = sig;
+  publishSessionDoc(s.sales.salesId, payload)
+    .catch(err => { s._lastSig = null; logError('MON', 'Gagal publish status sesi', err, label(s)); });
 }
 
 function noteError(s, where, err) {
@@ -140,7 +145,8 @@ async function heartbeatTick() {
   } catch (err) { logError('MON', 'Heartbeat gagal', err); }
 }
 setTimeout(heartbeatTick, 5000).unref?.();
-setInterval(heartbeatTick, 60 * 1000).unref?.();
+// Default 5 menit (dulu 1 menit = 1.440 tulis/hari hanya untuk detak server).
+setInterval(heartbeatTick, Number(process.env.HEARTBEAT_MS || 5 * 60 * 1000)).unref?.();
 
 export function listSessions() { return [...sessions.values()].map(statusOf); }
 export function getSession(salesId) { const s = sessions.get(salesId); return s ? statusOf(s) : null; }
