@@ -76,59 +76,6 @@ export async function upsertLead({ sales, extracted }) {
 }
 
 // ------------------------------------------------------------
-// JAM CHAT TERAKHIR (dibaca dashboard web)
-// Dicatat oleh VPS untuk SEMUA chat pribadi (masuk & keluar), bukan cuma
-// yang terdeteksi sebagai lead. Satu dokumen per (sales, nomor customer):
-//   waChatTimes/{salesId}_{nomor}
-//   lastUserChatAt  = chat terakhir dari customer
-//   lastSalesChatAt = chat terakhir dari sales
-// Dashboard mencocokkannya ke leads lewat salesId + nomorWa.
-// ------------------------------------------------------------
-// Dikumpulkan di memori lalu ditulis tiap CHAT_FLUSH_MS (default 2 menit)
-// dalam satu batch. Banyak chat dari satu customer = 1 tulis, bukan 1 per pesan.
-const pendingChat = new Map(); // docId -> { salesId, branch, nomorWa, lastUserChatAt?, lastSalesChatAt? }
-const CHAT_FLUSH_MS = Number(process.env.CHAT_FLUSH_MS || 120000);
-
-export async function recordChatTime({ sales, phone, fromMe, at }) {
-  const digits = String(phone || '').replace(/\D/g, '');
-  if (!digits) return false;
-  const when = at instanceof Date && !Number.isNaN(at.getTime()) ? at : new Date();
-  const docId = `${sales.salesId}_${digits}`;
-  const field = fromMe ? 'lastSalesChatAt' : 'lastUserChatAt';
-  const cur = pendingChat.get(docId) || { salesId: sales.salesId, branch: sales.branch || '', nomorWa: digits };
-  if (!cur[field] || when > cur[field]) cur[field] = when;
-  pendingChat.set(docId, cur);
-  return true;
-}
-
-export async function flushChatTimes() {
-  if (!pendingChat.size) return 0;
-  const entries = [...pendingChat];
-  pendingChat.clear();
-  let done = 0;
-  try {
-    for (let i = 0; i < entries.length; i += 400) {
-      const batch = db.batch();
-      for (const [id, data] of entries.slice(i, i + 400)) {
-        batch.set(db.collection('waChatTimes').doc(id), { ...data, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-      }
-      await batch.commit();
-      done += Math.min(400, entries.length - i);
-    }
-  } catch (err) {
-    // Gagal (mis. kuota habis) -> kembalikan ke antrean supaya dicoba lagi nanti.
-    for (const [id, data] of entries.slice(done)) {
-      const cur = pendingChat.get(id);
-      pendingChat.set(id, cur ? { ...data, ...cur } : data);
-    }
-    while (pendingChat.size > 5000) pendingChat.delete(pendingChat.keys().next().value);
-    throw err;
-  }
-  return done;
-}
-setInterval(() => flushChatTimes().catch((e) => console.error('[CHAT] Gagal flush jam chat:', e?.message || e)), CHAT_FLUSH_MS).unref?.();
-
-// ------------------------------------------------------------
 // MONITORING AKUN WA (dibaca halaman "Monitoring akun" di dashboard)
 //   waSessions/{salesId}  = status koneksi WhatsApp tiap sales
 //   waServer/status       = detak jantung (heartbeat) server VPS
