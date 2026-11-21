@@ -15,7 +15,18 @@ const baileysLogger = pino({ level: 'silent' });
 function log(tag, message, detail) {
   console.log(detail ? `[${tag}] ${message} | ${detail}` : `[${tag}] ${message}`);
 }
+// Error kuota Firestore (RESOURCE_EXHAUSTED / "Quota exceeded") sengaja TIDAK
+// ditampilkan sebagai error: sifatnya sementara, draft ditahan lalu dicoba
+// lagi otomatis. Cukup satu catatan singkat tiap 10 menit supaya log bersih.
+const isQuotaError = (err) => err?.code === 8 || /RESOURCE_EXHAUSTED|quota exceeded/i.test(String(err?.message || err || ''));
+let lastQuotaNote = 0;
+function quotaNotice() {
+  if (Date.now() - lastQuotaNote < 10 * 60 * 1000) return;
+  lastQuotaNote = Date.now();
+  console.log(`[QUOTA] Kuota Firestore habis, menunggu reset. Draft ditahan: ${typeof failedDrafts !== 'undefined' ? failedDrafts.length : 0}`);
+}
 function logError(tag, message, err, detail) {
+  if (isQuotaError(err)) { quotaNotice(); return; }
   const errMsg = err?.message || err;
   console.error(detail ? `[${tag}] ${message}: ${errMsg} | ${detail}` : `[${tag}] ${message}: ${errMsg}`);
 }
@@ -165,6 +176,7 @@ function syncSession(s) {
 }
 
 function noteError(s, where, err) {
+  if (isQuotaError(err)) return; // kuota habis: bukan error sesi, jangan ditampilkan di Monitor
   s.lastError = `${where}: ${String(err?.message || err).slice(0, 300)}`;
   s.lastErrorAt = Date.now();
   syncSession(s);
@@ -670,7 +682,11 @@ export async function restoreSessions() {
   if (restoring) return;
   restoring = true;
   try {
-    if (!fs.existsSync(metadataPath)) return;
+    log('WA', 'Memulihkan sesi WhatsApp', `data=${config.dataDir} | sesi=${config.sessionsDir}`);
+    if (!fs.existsSync(metadataPath)) {
+      log('WA', 'TIDAK ADA data sesi tersimpan (sales-sessions.json belum ada). Tidak ada akun yang dipulihkan', 'kalau ini terjadi setelah redeploy, folder data tidak permanen (butuh volume) — sales perlu scan QR ulang');
+      return;
+    }
     let entries;
     try { entries = JSON.parse(fs.readFileSync(metadataPath, 'utf8')); }
     catch (err) {
@@ -680,6 +696,7 @@ export async function restoreSessions() {
       return;
     }
     if (!Array.isArray(entries)) return;
+    log('WA', `Ditemukan ${entries.length} sesi tersimpan`, `aktif=${entries.filter((e) => e.enabled !== false).length}`);
     for (const item of entries) {
       if (item.enabled === false || !item.salesId) continue;
       const s = newSession({ salesId: item.salesId, salesName: item.salesName, branch: item.branch });
@@ -694,5 +711,5 @@ export async function restoreSessions() {
       await sleep(500); // beri jeda antar sesi supaya tidak serentak
     }
   } catch (err) { logError('WA', 'Gagal memulihkan sesi', err); }
-  finally { restoring = false; }
+  finally { restoring = false; log('WA', 'Selesai memulihkan sesi', `${sessions.size} sesi di memori`); }
 }
